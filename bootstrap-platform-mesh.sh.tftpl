@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec > >(tee -a /var/log/platform-mesh-bootstrap.log) 2>&1
+
+echo "Waiting for internet connectivity and DNS..."
+for i in {1..30}; do
+  if curl -fsSL --connect-timeout 2 https://google.com >/dev/null; then
+    echo "Internet is UP"
+    break
+  fi
+  echo "Still waiting..."
+  sleep 2
+done
+
+VM_USER="${vm_user}"
+PLATFORM_MESH_VERSION="${platform_mesh_version}"
+CLOUDFLARE_TUNNEL_TOKEN="${cloudflare_tunnel_token}"
+PUBLIC_IP="${public_ip}"
+PLATFORM_MESH_ROOT="/opt/platform-mesh"
+PLATFORM_MESH_HOME="$${PLATFORM_MESH_ROOT}/helm-charts"
+
+run_as_user() {
+  local user_id
+  user_id=$(id -u "$${VM_USER}")
+  sudo -H -u "$${VM_USER}" env "XDG_RUNTIME_DIR=/run/user/$${user_id}" bash -lc "$1"
+}
+
+append_if_missing() {
+  local file="$1"
+  local line="$2"
+
+  if ! grep -Fqx "$${line}" "$${file}" 2>/dev/null; then
+    echo "$${line}" >>"$${file}"
+  fi
+}
+
+write_file_as_user() {
+  local path="$1"
+  local tmp_file
+
+  tmp_file="$(mktemp)"
+  cat >"$${tmp_file}"
+  install -o "$${VM_USER}" -g "$${VM_USER}" -m 0644 "$${tmp_file}" "$${path}"
+  rm -f "$${tmp_file}"
+}
+
+install_kubectl() {
+  local version
+  local checksum
+
+  version="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+  curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/$${version}/bin/linux/amd64/kubectl"
+  checksum="$(curl -fsSL https://dl.k8s.io/release/$${version}/bin/linux/amd64/kubectl.sha256)"
+  echo "$${checksum}  /tmp/kubectl" | sha256sum --check
+  
+  install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+  rm -f /tmp/kubectl
+}
+
+install_kind() {
+  local version="v0.31.0"
+  local checksum_url="https://github.com/kubernetes-sigs/kind/releases/download/$${version}/kind-linux-amd64.sha256sum"
+  local checksum
+
+  curl -fsSLo /tmp/kind "https://kind.sigs.k8s.io/dl/$${version}/kind-linux-amd64"
+  checksum="$(curl -fsSL "$${checksum_url}" | awk '{print $1}')"
+  
+  echo "$${checksum}  /tmp/kind" | sha256sum --check
+  install -o root -g root -m 0755 /tmp/kind /usr/local/bin/kind
+  rm -f /tmp/kind
+}
+
+install_helm() {
+  local version="v3.14.3"
+  local checksum="3c90f24e180f8c207b8a18e5ec82cb0fa49858a7a0a86e4ed52a98398681e00b"
+  
+  curl -fsSLo /tmp/helm.tar.gz "https://get.helm.sh/helm-$${version}-linux-amd64.tar.gz"
+  echo "$${checksum}  /tmp/helm.tar.gz" | sha256sum --check
+  
+  mkdir -p /tmp/helm
+  tar -xzf /tmp/helm.tar.gz -C /tmp/helm
+  install -o root -g root -m 0755 /tmp/helm/linux-amd64/helm /usr/local/bin/helm
+  rm -rf /tmp/helm /tmp/helm.tar.gz
+}
+
+install_yq() {
+  local version="v4.43.1"
+  local checksum="cfbbb9ba72c9402ef4ab9d8f843439693dfb380927921740e51706d90869c7e1"
+  
+  curl -fsSLo /tmp/yq "https://github.com/mikefarah/yq/releases/download/$${version}/yq_linux_amd64"
+  echo "$${checksum}  /tmp/yq" | sha256sum --check
+  
+  install -o root -g root -m 0755 /tmp/yq /usr/local/bin/yq
+  rm -f /tmp/yq
+}
+
+configure_shell() {
+  write_file_as_user "/home/$${VM_USER}/.platform-mesh-shell.rc" <<EOF
+shopt -s expand_aliases
+
+if [ -f /etc/bash_completion ]; then
+  . /etc/bash_completion
+fi
+
+export XDG_RUNTIME_DIR="/run/user/\$(id -u)"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=\$XDG_RUNTIME_DIR/bus"
+
+source <(kubectl completion bash)
+alias k=kubectl
+complete -o default -F __start_kubectl k
+
+export PATH="/home/$${VM_USER}/bin:\$PATH"
+export KIND_EXPERIMENTAL_PROVIDER=podman
+export PLATFORM_MESH_HOME=$${PLATFORM_MESH_HOME}
+alias pm-admin='export KUBECONFIG=$${PLATFORM_MESH_HOME}/.secret/kcp/admin.kubeconfig'
+EOF
+
+  append_if_missing "/home/$${VM_USER}/.bashrc" "[ -f \"\$HOME/.platform-mesh-shell.rc\" ] && . \"\$HOME/.platform-mesh-shell.rc\""
+  append_if_missing "/home/$${VM_USER}/.profile" "[ -f \"\$HOME/.platform-mesh-shell.rc\" ] && . \"\$HOME/.platform-mesh-shell.rc\""
+}
+
+write_start_script() {
+  write_file_as_user "/home/$${VM_USER}/start-platform-mesh.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+export KIND_EXPERIMENTAL_PROVIDER=podman
+export XDG_RUNTIME_DIR="/run/user/\$(id -u)"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=\$XDG_RUNTIME_DIR/bus"
+export PATH="/home/$${VM_USER}/bin:\$PATH"
+
+cd "$${PLATFORM_MESH_HOME}"
+./local-setup/scripts/start.sh
+EOF
+
+  chmod 0755 "/home/$${VM_USER}/start-platform-mesh.sh"
+}
+
+configure_podman() {
+  local user_id
+  user_id=$(id -u "$${VM_USER}")
+
+  loginctl enable-linger "$${VM_USER}"
+
+  # Wait for user manager to be ready
+  for i in {1..10}; do
+    if [[ -S "/run/user/$${user_id}/systemd/private" ]]; then break; fi
+    sleep 1
+  done
+
+  run_as_user "systemctl --user start dbus.socket"
+
+  install -d -o "$${VM_USER}" -g "$${VM_USER}" -m 0755 "/home/$${VM_USER}/.config"
+  install -d -o "$${VM_USER}" -g "$${VM_USER}" -m 0755 "/home/$${VM_USER}/.config/containers"
+
+  # Let podman auto-detect the best storage driver (vfs/overlay) based on the filesystem
+  # to avoid fatal conflicts if the database was already initialized with a different driver.
+  rm -f "/home/$${VM_USER}/.config/containers/storage.conf"
+}
+
+patch_kind_config() {
+  local kind_config="$${PLATFORM_MESH_HOME}/local-setup/kind/kind-config.yaml"
+  
+  if [[ -f "$${kind_config}" ]]; then
+    # Detect the actual private IP (search specifically for 172.x range)
+    # Wait for up to 60 seconds for the private IP to be assigned
+    local private_ip=""
+    echo "Waiting for private IP assignment..."
+    for i in {1..30}; do
+      private_ip=$(hostname -I | tr ' ' '\n' | grep '^172\.' | head -n 1 || true)
+      if [[ -n "$${private_ip}" ]]; then
+        break
+      fi
+      sleep 2
+    done
+    
+    if [[ -z "$${private_ip}" ]]; then
+       private_ip="0.0.0.0" # Final fallback
+    fi
+
+    echo "Detected Private IP for SANs: $${private_ip}"
+
+    # 1. Prepare a temporary patch file to avoid escaping issues
+    cat <<EOF > /tmp/kubeadm-patch.txt
+kind: ClusterConfiguration
+apiServer:
+  certSANs:
+    - $${private_ip}
+    - 0.0.0.0
+    - 127.0.0.1
+    - localhost
+EOF
+
+    # 2. Apply patches via yq
+    run_as_user "yq -i '.nodes[0].extraPortMappings[] |= select(.hostPort == 8443).listenAddress = \"0.0.0.0\"' '$${kind_config}'"
+    run_as_user "yq -i '.networking.apiServerAddress = \"0.0.0.0\" | .networking.apiServerPort = 6443' '$${kind_config}'"
+    # CRITICAL: Use load_str so kind sees a multi-line string, not a nested YAML object!
+    run_as_user "yq -i '.nodes[0].kubeadmConfigPatches += [load_str(\"/tmp/kubeadm-patch.txt\")]' '$${kind_config}'"
+    run_as_user "yq -i '.nodes += [{\"role\": \"worker\", \"labels\": {\"stateful\": \"true\"}}, {\"role\": \"worker\"}] | .nodes |= unique_by(.role + (.labels.stateful // \"\"))' '$${kind_config}'"
+    
+    rm -f /tmp/kubeadm-patch.txt
+  fi
+}
+
+patch_platform_mesh_cr() {
+  local pm_cr="$${PLATFORM_MESH_HOME}/local-setup/kustomize/components/platform-mesh-operator-resource/platform-mesh.yaml"
+  
+  if [[ -f "$${pm_cr}" ]]; then
+    run_as_user "yq -i '.spec.values.keycloak.values.nodeSelector = {\"stateful\": \"true\"}' '$${pm_cr}'"
+    run_as_user "yq -i '.spec.values.keycloak.values.postgresql.primary.nodeSelector = {\"stateful\": \"true\"}' '$${pm_cr}'"
+    run_as_user "yq -i '.spec.values.openfga.values.nodeSelector = {\"stateful\": \"true\"}' '$${pm_cr}'"
+    run_as_user "yq -i '.spec.values.openfga.values.postgresql.primary.nodeSelector = {\"stateful\": \"true\"}' '$${pm_cr}'"
+  fi
+}
+
+install_cloudflare_tunnel() {
+  if [[ -n "$${CLOUDFLARE_TUNNEL_TOKEN}" ]]; then
+    curl -L --output /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+    dpkg -i /tmp/cloudflared.deb
+    rm /tmp/cloudflared.deb
+
+    cloudflared service install "$${CLOUDFLARE_TUNNEL_TOKEN}"
+  fi
+}
+
+main() {
+  install_kubectl
+  install_kind
+  install_helm
+  install_yq
+  install_cloudflare_tunnel
+  configure_shell
+  configure_podman
+
+  install -d -o "$${VM_USER}" -g "$${VM_USER}" "$${PLATFORM_MESH_ROOT}"
+  chown -R "$${VM_USER}:$${VM_USER}" "$${PLATFORM_MESH_ROOT}"
+  
+  if [[ ! -d "$${PLATFORM_MESH_HOME}/.git" ]]; then
+    run_as_user "git clone https://github.com/platform-mesh/helm-charts.git '$${PLATFORM_MESH_HOME}'"
+  fi
+
+  run_as_user "cd '$${PLATFORM_MESH_HOME}' && git fetch --tags --force && git checkout '$${PLATFORM_MESH_VERSION}'"
+  
+  patch_kind_config
+  patch_platform_mesh_cr
+  write_start_script
+
+  # Run the full start script.
+  run_as_user "bash /home/$${VM_USER}/start-platform-mesh.sh"
+  
+  wall "Platform Mesh cluster provisioned and ready! You can now access the onboarding portal at https://portal.localhost:8443"
+}
+
+main "$@"
