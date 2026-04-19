@@ -1,0 +1,48 @@
+#cloud-config
+users:
+  - name: ${vm_user}
+    groups: sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+disable_root: true
+
+package_update: true
+packages:
+  - bash-completion
+  - ca-certificates
+  - curl
+  - dbus-user-session
+  - fail2ban
+  - fuse-overlayfs
+  - git
+  - jq
+  - libnss3-tools
+  - mkcert
+  - podman
+  - slirp4netns
+  - uidmap
+  - unattended-upgrades
+  - unzip
+  - yq
+  - htop
+
+write_files:
+  - path: /etc/sysctl.d/99-inotify.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      fs.inotify.max_user_instances = 512
+      fs.inotify.max_user_watches = 524288
+
+  - path: /usr/local/bin/bootstrap-platform-mesh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      ${indent(6, trimspace(bootstrap_script))}
+
+runcmd:
+  - sysctl -p /etc/sysctl.d/99-inotify.conf
+  - /usr/local/bin/bootstrap-platform-mesh
