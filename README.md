@@ -1,74 +1,67 @@
 # Platform Mesh VM on Scaleway
 
-This repository provisions a Debian VM on Scaleway and bootstraps the Platform Mesh local setup automatically on first boot.
+This repository provisions a Debian VM on Scaleway and bootstraps the Platform Mesh local setup automatically on first boot. 
 
-The VM keeps Platform Mesh bound to the VM's local loopback interface and exposes only SSH publicly. That matches the upstream `portal.localhost` access model more closely than the previous Tailscale-based approach and avoids exposing the local development stack directly on the internet.
+The infrastructure is optimized for secure, direct access via **Cloudflare WARP**, allowing you to interact with the Kubernetes API and the Onboarding Portal without SSH tunnels or "insecure" TLS flags.
 
 ## What Terraform Provisions
 
-- A Scaleway public IP
-- A security group that allows SSH only
-- A Debian Bookworm VM
-- A cloud-init bootstrap that installs Podman, `kubectl`, `kind`, `helm`, `mkcert`, and the supporting CLI tools
-- An automated checkout of `platform-mesh/helm-charts` at `0.2.0`
-- A ready-to-run launcher script for Platform Mesh using Podman after login
+- A Scaleway public IP and Private VPC interface.
+- A security group that allows SSH (22), K8s API (6443), Portal (8443), and ICMP.
+- A Debian Bookworm VM with Podman and Kind.
+- **Cloudflare Tunnel** integration for Private Network routing.
+- **Dynamic Certificate Injection**: The bootstrap script automatically detects the VM's private IP and injects it into the Kubernetes API server's certificate SANs, ensuring full TLS trust over WARP.
 
 ## Required Inputs
 
-- `ssh_public_key`: SSH public key for the VM user
+- `ssh_public_key`: SSH public key for the VM user.
+- `cloudflare_tunnel_token`: The token for your pre-configured Cloudflare Tunnel.
 
 ## Optional Inputs
 
-- `vm_user`: Linux user created on the VM. Defaults to `naira`
-- `ssh_allowed_cidr`: CIDR allowed to reach SSH. Defaults to `0.0.0.0/0`
-- `platform_mesh_version`: Git ref to deploy from `platform-mesh/helm-charts`. Defaults to `0.2.0`
+- `vm_user`: Linux user created on the VM. Defaults to `naira`.
+- `ssh_allowed_cidr`: CIDR allowed to reach SSH. Defaults to `0.0.0.0/0`.
+- `platform_mesh_version`: Git ref to deploy from `platform-mesh/helm-charts`. Defaults to `0.2.0`.
 
-## Usage
+## Setup & Usage
 
-1. Initialize Terraform:
+### 1. Cloudflare Dashboard Configuration
+Before applying, ensure your Cloudflare Zero Trust dashboard is configured:
+- **Tunnel Route**: Add a Private Network route for `172.16.0.0/22` (or the specific VM IP) to your tunnel.
+- **Split Tunneling**: Ensure your WARP client settings include the `172.16.x.x` range.
 
-   ```bash
-   terraform init
-   ```
+### 2. Deploy
+```bash
+terraform apply \
+  -var="ssh_public_key=$(cat ~/.ssh/id_ed25519.pub)" \
+  -var="cloudflare_tunnel_token=your_token_here"
+```
 
-2. Apply the configuration with your SSH public key:
+### 3. Connect via Cloudflare WARP
 
-   ```bash
-   terraform apply -var='ssh_public_key=ssh-ed25519 AAAA...'
-   ```
+Once the bootstrap finishes (check `/var/log/platform-mesh-bootstrap.log` on the VM), use the generated helper command from Terraform outputs to set up your local `kubectl`:
 
-3. Wait for cloud-init to finish. The first boot installs tools, prepares the checkout, and writes the launch helper.
+```bash
+# Example command from 'terraform output warp_kubeconfig_command'
+scp naira@<PUBLIC_IP>:/home/naira/.kube/config ./kind.kubeconfig
+sed -i '' 's/127.0.0.1:6443/<PRIVATE_IP>:6443/g' ./kind.kubeconfig
+export KUBECONFIG=$(pwd)/kind.kubeconfig
 
-4. Connect to the VM:
+# Test direct, secure access (No warnings!)
+kubectl get nodes
+```
 
-   ```bash
-   ssh <vm-user>@<public-ip>
-   ```
+### 4. Access the Portal
+To access the onboarding portal at `https://portal.localhost:8443`, add the following to your workstation's `/etc/hosts`:
 
-5. Start Platform Mesh from the VM shell:
-
-   ```bash
-   ~/start-platform-mesh.sh
-   ```
-
-6. Tunnel the portal back to your workstation:
-
-   ```bash
-   ssh -L 8443:127.0.0.1:8443 <vm-user>@<public-ip>
-   ```
-
-7. Open the portal locally:
-
-   ```text
-   https://portal.localhost:8443
-   ```
+```text
+<PRIVATE_IP>  portal.localhost
+```
 
 ## Operational Notes
 
-- Bootstrap logs are written to `/var/log/platform-mesh-bootstrap.log`.
-- The Platform Mesh checkout lives at `/opt/platform-mesh/helm-charts` and is owned by `<vm-user>`.
-- The launcher script is written to `/home/<vm-user>/start-platform-mesh.sh`.
-- The shell profile is written to `/home/<vm-user>/.platform-mesh-shell.rc` and sourced from `.bashrc`. It provides `kubectl` completion, the `k` alias, `KIND_EXPERIMENTAL_PROVIDER=podman`, and the `pm-admin` alias.
-- `yq` is installed as the standalone binary in `/usr/local/bin/yq`.
-- The upstream local setup generates its own `mkcert` CA on the VM. Your browser may warn until you copy and trust `/home/<vm-user>/.local/share/mkcert/rootCA.pem` on your workstation.
-- The admin kubeconfig created by the setup is available under `local-setup/.secret/kcp/admin.kubeconfig` inside the cloned repository.
+- **Bootstrap Logs**: Monitor progress with `ssh naira@<PUBLIC_IP> "tail -f /var/log/platform-mesh-bootstrap.log"`.
+- **Certificates**: The Kubernetes API certificate is automatically generated to trust the VM's private IP.
+- **Shell Profile**: Sourced from `.bashrc`, providing `k` alias, `kubectl` completion, and `KIND_EXPERIMENTAL_PROVIDER=podman`.
+- **Kind Wrapper**: A wrapper at `~/bin/kind` ensures that internal setup scripts do not overwrite our custom TLS settings.
+- **Trusting the Portal**: To trust the portal's browser certificate, run `terraform output mkcert_root_ca_copy_command` and add the PEM to your OS keychain.
