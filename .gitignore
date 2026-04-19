@@ -11,4 +11,4 @@ terraform.tfvars.json
 # Local connection files
 *.kubeconfig
 *.pem
-
+*.hcl
