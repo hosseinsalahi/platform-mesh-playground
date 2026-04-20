@@ -26,8 +26,8 @@ packages:
   - uidmap
   - unattended-upgrades
   - unzip
-  - yq
   - htop
+  - net-tools
 
 write_files:
   - path: /etc/sysctl.d/99-inotify.conf

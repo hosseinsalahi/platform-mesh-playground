@@ -15,10 +15,9 @@ done
 
 VM_USER="${vm_user}"
 PLATFORM_MESH_VERSION="${platform_mesh_version}"
-CLOUDFLARE_TUNNEL_TOKEN="${cloudflare_tunnel_token}"
-PUBLIC_IP="${public_ip}"
 PLATFORM_MESH_ROOT="/opt/platform-mesh"
 PLATFORM_MESH_HOME="$${PLATFORM_MESH_ROOT}/helm-charts"
+TEAM_RBAC_SYNC_SCRIPT="/home/$${VM_USER}/bin/sync-platform-mesh-team-access"
 
 run_as_user() {
   local user_id
@@ -45,6 +44,14 @@ write_file_as_user() {
   rm -f "$${tmp_file}"
 }
 
+detect_private_ip() {
+  hostname -I | tr ' ' '\n' | awk '
+    /^10\./ { print; exit }
+    /^192\.168\./ { print; exit }
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./ { print; exit }
+  '
+}
+
 install_kubectl() {
   local version
   local checksum
@@ -53,7 +60,7 @@ install_kubectl() {
   curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/$${version}/bin/linux/amd64/kubectl"
   checksum="$(curl -fsSL https://dl.k8s.io/release/$${version}/bin/linux/amd64/kubectl.sha256)"
   echo "$${checksum}  /tmp/kubectl" | sha256sum --check
-  
+
   install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
   rm -f /tmp/kubectl
 }
@@ -65,7 +72,7 @@ install_kind() {
 
   curl -fsSLo /tmp/kind "https://kind.sigs.k8s.io/dl/$${version}/kind-linux-amd64"
   checksum="$(curl -fsSL "$${checksum_url}" | awk '{print $1}')"
-  
+
   echo "$${checksum}  /tmp/kind" | sha256sum --check
   install -o root -g root -m 0755 /tmp/kind /usr/local/bin/kind
   rm -f /tmp/kind
@@ -74,10 +81,10 @@ install_kind() {
 install_helm() {
   local version="v3.14.3"
   local checksum="3c90f24e180f8c207b8a18e5ec82cb0fa49858a7a0a86e4ed52a98398681e00b"
-  
+
   curl -fsSLo /tmp/helm.tar.gz "https://get.helm.sh/helm-$${version}-linux-amd64.tar.gz"
   echo "$${checksum}  /tmp/helm.tar.gz" | sha256sum --check
-  
+
   mkdir -p /tmp/helm
   tar -xzf /tmp/helm.tar.gz -C /tmp/helm
   install -o root -g root -m 0755 /tmp/helm/linux-amd64/helm /usr/local/bin/helm
@@ -87,10 +94,10 @@ install_helm() {
 install_yq() {
   local version="v4.43.1"
   local checksum="cfbbb9ba72c9402ef4ab9d8f843439693dfb380927921740e51706d90869c7e1"
-  
+
   curl -fsSLo /tmp/yq "https://github.com/mikefarah/yq/releases/download/$${version}/yq_linux_amd64"
   echo "$${checksum}  /tmp/yq" | sha256sum --check
-  
+
   install -o root -g root -m 0755 /tmp/yq /usr/local/bin/yq
   rm -f /tmp/yq
 }
@@ -137,15 +144,154 @@ EOF
   chmod 0755 "/home/$${VM_USER}/start-platform-mesh.sh"
 }
 
+write_team_access_script() {
+  install -d -o "$${VM_USER}" -g "$${VM_USER}" -m 0755 "/home/$${VM_USER}/bin"
+
+  write_file_as_user "$${TEAM_RBAC_SYNC_SCRIPT}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ADMIN_KUBECONFIG="$HOME/.kube/config"
+TEAM_KUBECONFIG="$HOME/.kube/platform-mesh-team.kubeconfig"
+SERVICE_ACCOUNT_NAMESPACE="default"
+SERVICE_ACCOUNT_NAME="platform-mesh-team"
+TOKEN_SECRET_NAME="platform-mesh-team-token"
+ROLEBINDING_NAME="platform-mesh-team-view"
+LEGACY_ROLEBINDING_NAME="platform-mesh-team-edit"
+ROLE_NAME="view"
+CLUSTER_ROLE_NAME="platform-mesh-team-namespace-reader"
+CLUSTER_ROLE_BINDING_NAME="platform-mesh-team-namespace-reader"
+EXCLUDED_NAMESPACE_PATTERN='^(kube-system|kube-public|kube-node-lease)$'
+PRIVATE_IP="$(detect_private_ip || true)"
+
+if [[ -z "$PRIVATE_IP" ]]; then
+  echo "Unable to detect VM private IP for team kubeconfig generation" >&2
+  exit 1
+fi
+
+kubectl_admin() {
+  kubectl --kubeconfig "$ADMIN_KUBECONFIG" "$@"
+}
+
+kubectl_admin -n "$SERVICE_ACCOUNT_NAMESPACE" create serviceaccount "$SERVICE_ACCOUNT_NAME" --dry-run=client -o yaml | kubectl_admin apply -f -
+
+cat <<MANIFEST | kubectl_admin apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: $TOKEN_SECRET_NAME
+  namespace: $SERVICE_ACCOUNT_NAMESPACE
+  annotations:
+    kubernetes.io/service-account.name: $SERVICE_ACCOUNT_NAME
+type: kubernetes.io/service-account-token
+MANIFEST
+
+cat <<MANIFEST | kubectl_admin apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: $CLUSTER_ROLE_NAME
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+MANIFEST
+
+cat <<MANIFEST | kubectl_admin apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: $CLUSTER_ROLE_BINDING_NAME
+subjects:
+  - kind: ServiceAccount
+    name: $SERVICE_ACCOUNT_NAME
+    namespace: $SERVICE_ACCOUNT_NAMESPACE
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: $CLUSTER_ROLE_NAME
+MANIFEST
+
+while IFS= read -r namespace; do
+  if [[ "$namespace" =~ $EXCLUDED_NAMESPACE_PATTERN ]]; then
+    kubectl_admin -n "$namespace" delete rolebinding "$ROLEBINDING_NAME" --ignore-not-found
+    kubectl_admin -n "$namespace" delete rolebinding "$LEGACY_ROLEBINDING_NAME" --ignore-not-found
+    continue
+  fi
+
+  cat <<MANIFEST | kubectl_admin apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: $ROLEBINDING_NAME
+  namespace: $namespace
+subjects:
+  - kind: ServiceAccount
+    name: $SERVICE_ACCOUNT_NAME
+    namespace: $SERVICE_ACCOUNT_NAMESPACE
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: $ROLE_NAME
+MANIFEST
+
+  kubectl_admin -n "$namespace" delete rolebinding "$LEGACY_ROLEBINDING_NAME" --ignore-not-found
+done < <(kubectl_admin get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+
+token_b64=""
+for _ in {1..30}; do
+  token_b64="$(kubectl_admin -n "$SERVICE_ACCOUNT_NAMESPACE" get secret "$TOKEN_SECRET_NAME" -o jsonpath='{.data.token}' 2>/dev/null || true)"
+  if [[ -n "$token_b64" ]]; then
+    break
+  fi
+  sleep 1
+done
+
+if [[ -z "$token_b64" ]]; then
+  echo "Timed out waiting for team service account token secret" >&2
+  exit 1
+fi
+
+ca_data="$(kubectl_admin config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')"
+token="$(printf '%s' "$token_b64" | base64 --decode)"
+
+cat >"$TEAM_KUBECONFIG" <<KUBECONFIG
+apiVersion: v1
+kind: Config
+clusters:
+  - cluster:
+      certificate-authority-data: $ca_data
+      server: https://$PRIVATE_IP:6443
+    name: platform-mesh
+contexts:
+  - context:
+      cluster: platform-mesh
+      namespace: default
+      user: platform-mesh-team
+    name: platform-mesh-team
+current-context: platform-mesh-team
+users:
+  - name: platform-mesh-team
+    user:
+      token: $token
+KUBECONFIG
+
+chmod 0600 "$TEAM_KUBECONFIG"
+EOF
+
+  chmod 0755 "$${TEAM_RBAC_SYNC_SCRIPT}"
+}
+
 configure_podman() {
   local user_id
   user_id=$(id -u "$${VM_USER}")
 
   loginctl enable-linger "$${VM_USER}"
 
-  # Wait for user manager to be ready
   for i in {1..10}; do
-    if [[ -S "/run/user/$${user_id}/systemd/private" ]]; then break; fi
+    if [[ -S "/run/user/$${user_id}/systemd/private" ]]; then
+      break
+    fi
     sleep 1
   done
 
@@ -154,35 +300,30 @@ configure_podman() {
   install -d -o "$${VM_USER}" -g "$${VM_USER}" -m 0755 "/home/$${VM_USER}/.config"
   install -d -o "$${VM_USER}" -g "$${VM_USER}" -m 0755 "/home/$${VM_USER}/.config/containers"
 
-  # Let podman auto-detect the best storage driver (vfs/overlay) based on the filesystem
-  # to avoid fatal conflicts if the database was already initialized with a different driver.
   rm -f "/home/$${VM_USER}/.config/containers/storage.conf"
 }
 
 patch_kind_config() {
   local kind_config="$${PLATFORM_MESH_HOME}/local-setup/kind/kind-config.yaml"
-  
+
   if [[ -f "$${kind_config}" ]]; then
-    # Detect the actual private IP (search specifically for 172.x range)
-    # Wait for up to 60 seconds for the private IP to be assigned
     local private_ip=""
     echo "Waiting for private IP assignment..."
     for i in {1..30}; do
-      private_ip=$(hostname -I | tr ' ' '\n' | grep '^172\.' | head -n 1 || true)
+      private_ip="$(detect_private_ip || true)"
       if [[ -n "$${private_ip}" ]]; then
         break
       fi
       sleep 2
     done
-    
+
     if [[ -z "$${private_ip}" ]]; then
-       private_ip="0.0.0.0" # Final fallback
+      private_ip="0.0.0.0"
     fi
 
     echo "Detected Private IP for SANs: $${private_ip}"
 
-    # 1. Prepare a temporary patch file to avoid escaping issues
-    cat <<EOF > /tmp/kubeadm-patch.txt
+    cat <<EOF >/tmp/kubeadm-patch.txt
 kind: ClusterConfiguration
 apiServer:
   certSANs:
@@ -192,20 +333,18 @@ apiServer:
     - localhost
 EOF
 
-    # 2. Apply patches via yq
     run_as_user "yq -i '.nodes[0].extraPortMappings[] |= select(.hostPort == 8443).listenAddress = \"0.0.0.0\"' '$${kind_config}'"
     run_as_user "yq -i '.networking.apiServerAddress = \"0.0.0.0\" | .networking.apiServerPort = 6443' '$${kind_config}'"
-    # CRITICAL: Use load_str so kind sees a multi-line string, not a nested YAML object!
     run_as_user "yq -i '.nodes[0].kubeadmConfigPatches += [load_str(\"/tmp/kubeadm-patch.txt\")]' '$${kind_config}'"
     run_as_user "yq -i '.nodes += [{\"role\": \"worker\", \"labels\": {\"stateful\": \"true\"}}, {\"role\": \"worker\"}] | .nodes |= unique_by(.role + (.labels.stateful // \"\"))' '$${kind_config}'"
-    
+
     rm -f /tmp/kubeadm-patch.txt
   fi
 }
 
 patch_platform_mesh_cr() {
   local pm_cr="$${PLATFORM_MESH_HOME}/local-setup/kustomize/components/platform-mesh-operator-resource/platform-mesh.yaml"
-  
+
   if [[ -f "$${pm_cr}" ]]; then
     run_as_user "yq -i '.spec.values.keycloak.values.nodeSelector = {\"stateful\": \"true\"}' '$${pm_cr}'"
     run_as_user "yq -i '.spec.values.keycloak.values.postgresql.primary.nodeSelector = {\"stateful\": \"true\"}' '$${pm_cr}'"
@@ -214,41 +353,31 @@ patch_platform_mesh_cr() {
   fi
 }
 
-install_cloudflare_tunnel() {
-  if [[ -n "$${CLOUDFLARE_TUNNEL_TOKEN}" ]]; then
-    curl -L --output /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-    dpkg -i /tmp/cloudflared.deb
-    rm /tmp/cloudflared.deb
-
-    cloudflared service install "$${CLOUDFLARE_TUNNEL_TOKEN}"
-  fi
-}
-
 main() {
   install_kubectl
   install_kind
   install_helm
   install_yq
-  install_cloudflare_tunnel
   configure_shell
   configure_podman
 
   install -d -o "$${VM_USER}" -g "$${VM_USER}" "$${PLATFORM_MESH_ROOT}"
   chown -R "$${VM_USER}:$${VM_USER}" "$${PLATFORM_MESH_ROOT}"
-  
+
   if [[ ! -d "$${PLATFORM_MESH_HOME}/.git" ]]; then
     run_as_user "git clone https://github.com/platform-mesh/helm-charts.git '$${PLATFORM_MESH_HOME}'"
   fi
 
   run_as_user "cd '$${PLATFORM_MESH_HOME}' && git fetch --tags --force && git checkout '$${PLATFORM_MESH_VERSION}'"
-  
+
   patch_kind_config
   patch_platform_mesh_cr
   write_start_script
+  write_team_access_script
 
-  # Run the full start script.
   run_as_user "bash /home/$${VM_USER}/start-platform-mesh.sh"
-  
+  run_as_user "bash '$${TEAM_RBAC_SYNC_SCRIPT}'"
+
   wall "Platform Mesh cluster provisioned and ready! You can now access the onboarding portal at https://portal.localhost:8443"
 }
 
