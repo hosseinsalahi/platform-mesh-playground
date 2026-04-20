@@ -5,8 +5,10 @@ crash.log
 crash.*.log
 terraform.tfvars
 terraform.tfvars.json
+dev.tfvars
 *.auto.tfvars
 *.auto.tfvars.json
+*.tfbackend
 
 # Local connection files
 *.kubeconfig
