@@ -44,10 +44,10 @@ The stack is designed for secure team access through **Cloudflare WARP**. The VM
 ### 1. Cloudflare Dashboard Configuration
 Before applying, make sure your Cloudflare Zero Trust tenant is ready for the team:
 - Create or reuse a remotely-managed `cloudflared` tunnel for this VM.
-- Keep the tunnel token outside Terraform; you will install it on the VM after `terraform apply`.
+- Keep the tunnel token outside your source code. You can pass it securely during apply using the `TF_VAR_cloudflare_tunnel_token` environment variable.
 - Export a Cloudflare API token with permission to manage Zero Trust apps, policies, devices, and tunnels.
 - If you do not configure team selectors in Terraform, define **device enrollment permissions** and private-network access manually in the dashboard.
-- If you want a clean shared portal hostname, publish a Cloudflare private hostname later. Without that, the portal still relies on `portal.localhost` plus a hosts-file entry.
+- The default portal hostname is `portal.localhost`, which works well with local `kubectl port-forward` access. If you want a clean shared portal hostname instead, publish a Cloudflare private hostname and set `platform_mesh_base_domain` to that DNS name.
 
 If you provide `cloudflare_account_id` and `cloudflare_tunnel_id`, Terraform will create the VM's `/32` private route automatically. If you also provide team selectors, Terraform will create:
 - An allow policy for the team.
@@ -84,12 +84,7 @@ Terraform fails fast on ambiguous Cloudflare combinations:
 - `cloudflare_account_id` and `cloudflare_tunnel_id` must be set together.
 - Domain-only selectors are not enough to manage the team WARP profile unless you also set `cloudflare_warp_profile_match`.
 
-After `terraform apply`, install the Cloudflare tunnel on the VM with the tunnel token supplied at execution time instead of through Terraform:
-
-```bash
-export CLOUDFLARE_TUNNEL_TOKEN=<CLOUDFLARE_TUNNEL_TOKEN>
-./scripts/install-cloudflare-tunnel.sh
-```
+If you provide `TF_VAR_cloudflare_tunnel_token` at apply time, bootstrap will install and start `cloudflared` automatically on first boot. If you leave that variable unset, Terraform will still provision the VM and Cloudflare resources, but you must install and configure `cloudflared` on the VM yourself.
 
 ### Terraform State Backend
 
@@ -120,7 +115,7 @@ If you are moving existing local state into the remote backend, use:
 terraform init -migrate-state -reconfigure -backend-config=scaleway.s3.tfbackend
 ```
 
-If you do not want Terraform to manage Cloudflare resources, leave the Cloudflare Terraform inputs unset and configure the private route and private apps manually in Cloudflare. You can still install `cloudflared` on the VM afterwards with `./scripts/install-cloudflare-tunnel.sh`.
+If you do not want Terraform to manage Cloudflare resources, leave the Cloudflare Terraform inputs unset and configure the private route and private apps manually in Cloudflare. You can still install and configure `cloudflared` on the VM separately if you need tunnel-based routing.
 
 To override the automatically-derived team-specific WARP profile, add variables like:
 
@@ -150,11 +145,12 @@ If the VM already existed before this RBAC automation was added, install the res
 ./scripts/setup-team-access.sh
 ```
 
-The generated team kubeconfig is backed by a dedicated service account that is bound to the built-in `view` ClusterRole only in non-system namespaces. That means:
+The generated team kubeconfig is backed by a dedicated service account that is bound to the built-in `admin` ClusterRole in non-system namespaces. That means:
 - team members can list namespaces
-- team members get read-only access in application namespaces
+- team members can create, update, and delete namespaced resources in application namespaces
 - team members do not get access in `kube-system`, `kube-public`, or `kube-node-lease`
 - they do not get Kubernetes node API access
+- they do get cluster-wide read/write access to `CustomResourceDefinition` objects
 - if you add namespaces later, rerun `./scripts/setup-team-access.sh`
 
 ### 4. Connect to Kubernetes via Cloudflare WARP
@@ -173,29 +169,32 @@ kubectl get nodes
 
 ### 5. Access the Portal
 
-The portal is not yet fully team-friendly out of the box. Today it still expects a local hostname plus the VM-generated root CA:
-- Add the hosts entry from `terraform output private_ip` plus ` portal.localhost` to your workstation's `/etc/hosts`, or run `./scripts/onboarding.sh` to print it.
-- Open `terraform output warp_portal_url`.
+The default portal workflow is local port-forwarding plus the VM-generated root CA:
+- Retrieve the restricted team kubeconfig and root CA instructions from `./scripts/onboarding.sh`.
+- Start a local forward with `kubectl --kubeconfig ./platform-mesh-team.kubeconfig -n default port-forward svc/traefik 8443:8443`.
+- Open `https://portal.localhost:8443`.
 - Import the PEM from the `scp` command printed by `./scripts/onboarding.sh` into your workstation trust store if your browser does not trust the portal certificate yet.
 
-Example hosts entry:
-
-```text
-<PRIVATE_IP>  portal.localhost
-```
-
-For a cleaner shared experience, publish a private Cloudflare hostname for the portal and stop relying on `/etc/hosts` plus the VM-generated CA.
+If you choose a custom shared hostname instead, set `platform_mesh_base_domain` to that DNS name and map it through your preferred private DNS path.
 
 ## Operational Notes
 
 - **Bootstrap Logs**: Monitor progress with `ssh naira@<PUBLIC_IP> "tail -f /var/log/platform-mesh-bootstrap.log"`.
 - **Certificates**: The Kubernetes API certificate is automatically generated to trust the VM's private IP.
 - **Public Exposure**: `6443` and `8443` are no longer exposed on the VM public IP; reach them through WARP.
-- **Tunnel Token Handling**: The Cloudflare tunnel token is intentionally kept out of Terraform state and cloud-init. Install or rotate it separately with `./scripts/install-cloudflare-tunnel.sh`.
+- **Tunnel Token Handling**: If you set `cloudflare_tunnel_token`, the token is rendered into `cloud-init` and stored in Terraform state so bootstrap can install `cloudflared` automatically. Treat your Terraform backend and VM user-data access as sensitive.
 - **Existing Enrollment Apps**: `cloudflare_manage_device_enrollment` defaults to `false` because Cloudflare allows only one WARP enrollment app per account.
 - **Account-Level WARP Auth**: `cloudflare_manage_zero_trust_organization` defaults to `false` because the Zero Trust organization object is persistent and Terraform warns about destroy semantics. Enable it only if you deliberately want Terraform to manage that account-level setting.
-- **Team Helper**: `./scripts/onboarding.sh` prints the live onboarding commands and hosts entry from Terraform outputs.
+- **Team Helper**: `./scripts/onboarding.sh` prints the live onboarding commands from Terraform outputs, including the local Traefik port-forward command when using `portal.localhost`.
 - **Restricted Team Kubeconfig**: Run `./scripts/onboarding.sh` to print the current copy command for secure distribution, and rerun `./scripts/setup-team-access.sh` after namespace changes.
 - **Shell Profile**: Sourced from `.bashrc`, providing `k` alias, `kubectl` completion, and `KIND_EXPERIMENTAL_PROVIDER=podman`.
 - **Kind Wrapper**: A wrapper at `~/bin/kind` ensures that internal setup scripts do not overwrite our custom TLS settings.
 - **Trusting the Portal**: To trust the portal's browser certificate, run `./scripts/onboarding.sh`, copy the printed root CA `scp` command, and add the PEM to your OS keychain.
+
+## Security Warning: Cloudflare Tunnel Token
+This repository has been updated to accept the `cloudflare_tunnel_token` as a sensitive Terraform variable. 
+
+To prevent this secret from leaking:
+1. **Never** hardcode the token in your `.tfvars` file.
+2. Pass it securely via the command line using `TF_VAR_cloudflare_tunnel_token="<your-token>" terraform apply`.
+3. Because the token is passed to `cloud-init`, it will be visible in the Scaleway console's "User Data" section for this VM, and it will be stored in your `terraform.tfstate` file. Ensure your Terraform backend (e.g., S3) is heavily restricted and encrypted.

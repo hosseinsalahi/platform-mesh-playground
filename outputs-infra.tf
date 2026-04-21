@@ -9,8 +9,8 @@ output "private_ip" {
 }
 
 output "warp_portal_url" {
-  description = "Portal URL to open when connected via Cloudflare WARP, after mapping portal.localhost to the VM private IP"
-  value       = "https://portal.localhost:8443"
+  description = "Portal URL to open. When platform_mesh_base_domain is portal.localhost, access it through a local kubectl port-forward to the traefik service."
+  value       = "https://${var.platform_mesh_base_domain}:8443"
 }
 
 output "warp_private_route_cidr" {

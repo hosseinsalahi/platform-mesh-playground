@@ -15,9 +15,20 @@ done
 
 VM_USER="${vm_user}"
 PLATFORM_MESH_VERSION="${platform_mesh_version}"
+PLATFORM_MESH_BASE_DOMAIN="${platform_mesh_base_domain}"
+CLOUDFLARE_TUNNEL_TOKEN="${cloudflare_tunnel_token}"
 PLATFORM_MESH_ROOT="/opt/platform-mesh"
 PLATFORM_MESH_HOME="$${PLATFORM_MESH_ROOT}/helm-charts"
 TEAM_RBAC_SYNC_SCRIPT="/home/$${VM_USER}/bin/sync-platform-mesh-team-access"
+BOOTSTRAP_STATE_DIR="/var/log/platform-mesh-bootstrap.d"
+BOOTSTRAP_DONE_MARKER="/var/log/platform-mesh-bootstrap.done"
+KIND_VERSION="v0.31.0"
+HELM_VERSION="v3.14.3"
+YQ_VERSION="v4.43.1"
+
+# Pinned ClusterIPs — these must match the values in the Platform Mesh CR
+# (infra.values.traefik.service.spec.clusterIP, etc.)
+TRAEFIK_CLUSTER_IP="10.96.188.4"
 
 run_as_user() {
   local user_id
@@ -52,9 +63,44 @@ detect_private_ip() {
   '
 }
 
+ensure_bootstrap_state_dir() {
+  install -d -m 0755 "$${BOOTSTRAP_STATE_DIR}"
+}
+
+stage_marker_path() {
+  printf '%s/%s.done' "$${BOOTSTRAP_STATE_DIR}" "$1"
+}
+
+stage_is_done() {
+  [[ -f "$(stage_marker_path "$1")" ]]
+}
+
+mark_stage_done() {
+  ensure_bootstrap_state_dir
+  touch "$(stage_marker_path "$1")"
+}
+
+run_stage_once() {
+  local stage="$1"
+  shift
+
+  if stage_is_done "$${stage}"; then
+    echo "Stage '$${stage}' already completed. Skipping."
+    return 0
+  fi
+
+  "$@"
+  mark_stage_done "$${stage}"
+}
+
 install_kubectl() {
   local version
   local checksum
+
+  if command -v kubectl >/dev/null 2>&1 && kubectl version --client >/dev/null 2>&1; then
+    echo "kubectl already installed. Skipping."
+    return 0
+  fi
 
   version="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
   curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/$${version}/bin/linux/amd64/kubectl"
@@ -66,9 +112,14 @@ install_kubectl() {
 }
 
 install_kind() {
-  local version="v0.31.0"
+  local version="$${KIND_VERSION}"
   local checksum_url="https://github.com/kubernetes-sigs/kind/releases/download/$${version}/kind-linux-amd64.sha256sum"
   local checksum
+
+  if command -v kind >/dev/null 2>&1 && kind --version 2>/dev/null | grep -Fq "$${version}"; then
+    echo "kind $${version} already installed. Skipping."
+    return 0
+  fi
 
   curl -fsSLo /tmp/kind "https://kind.sigs.k8s.io/dl/$${version}/kind-linux-amd64"
   checksum="$(curl -fsSL "$${checksum_url}" | awk '{print $1}')"
@@ -79,8 +130,13 @@ install_kind() {
 }
 
 install_helm() {
-  local version="v3.14.3"
+  local version="$${HELM_VERSION}"
   local checksum="3c90f24e180f8c207b8a18e5ec82cb0fa49858a7a0a86e4ed52a98398681e00b"
+
+  if command -v helm >/dev/null 2>&1 && helm version --short 2>/dev/null | grep -Fq "$${version}"; then
+    echo "helm $${version} already installed. Skipping."
+    return 0
+  fi
 
   curl -fsSLo /tmp/helm.tar.gz "https://get.helm.sh/helm-$${version}-linux-amd64.tar.gz"
   echo "$${checksum}  /tmp/helm.tar.gz" | sha256sum --check
@@ -92,14 +148,43 @@ install_helm() {
 }
 
 install_yq() {
-  local version="v4.43.1"
+  local version="$${YQ_VERSION}"
   local checksum="cfbbb9ba72c9402ef4ab9d8f843439693dfb380927921740e51706d90869c7e1"
+
+  if command -v yq >/dev/null 2>&1 && yq --version 2>/dev/null | grep -Fq "$${version}"; then
+    echo "yq $${version} already installed. Skipping."
+    return 0
+  fi
 
   curl -fsSLo /tmp/yq "https://github.com/mikefarah/yq/releases/download/$${version}/yq_linux_amd64"
   echo "$${checksum}  /tmp/yq" | sha256sum --check
 
   install -o root -g root -m 0755 /tmp/yq /usr/local/bin/yq
   rm -f /tmp/yq
+}
+
+install_cloudflared() {
+  if [[ -z "$${CLOUDFLARE_TUNNEL_TOKEN}" ]]; then
+    echo "No CLOUDFLARE_TUNNEL_TOKEN provided. Skipping cloudflared installation."
+    return 0
+  fi
+
+  if command -v cloudflared >/dev/null 2>&1; then
+    echo "cloudflared already installed."
+  else
+    echo "Installing cloudflared tunnel..."
+    curl -fsSLo /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+    dpkg -i /tmp/cloudflared.deb
+    rm -f /tmp/cloudflared.deb
+  fi
+
+  if systemctl cat cloudflared >/dev/null 2>&1; then
+    echo "cloudflared service already configured."
+  else
+    cloudflared service install "$${CLOUDFLARE_TUNNEL_TOKEN}" || true
+  fi
+
+  systemctl enable --now cloudflared || true
 }
 
 configure_shell() {
@@ -156,9 +241,9 @@ TEAM_KUBECONFIG="$HOME/.kube/platform-mesh-team.kubeconfig"
 SERVICE_ACCOUNT_NAMESPACE="default"
 SERVICE_ACCOUNT_NAME="platform-mesh-team"
 TOKEN_SECRET_NAME="platform-mesh-team-token"
-ROLEBINDING_NAME="platform-mesh-team-view"
+ROLEBINDING_NAME="platform-mesh-team-admin"
 LEGACY_ROLEBINDING_NAME="platform-mesh-team-edit"
-ROLE_NAME="view"
+ROLE_NAME="admin"
 CLUSTER_ROLE_NAME="platform-mesh-team-namespace-reader"
 CLUSTER_ROLE_BINDING_NAME="platform-mesh-team-namespace-reader"
 EXCLUDED_NAMESPACE_PATTERN='^(kube-system|kube-public|kube-node-lease)$'
@@ -195,6 +280,9 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["*"]
 MANIFEST
 
 cat <<MANIFEST | kubectl_admin apply -f -
@@ -335,11 +423,45 @@ EOF
 
     run_as_user "yq -i '.nodes[0].extraPortMappings[] |= select(.hostPort == 8443).listenAddress = \"0.0.0.0\"' '$${kind_config}'"
     run_as_user "yq -i '.networking.apiServerAddress = \"0.0.0.0\" | .networking.apiServerPort = 6443' '$${kind_config}'"
-    run_as_user "yq -i '.nodes[0].kubeadmConfigPatches += [load_str(\"/tmp/kubeadm-patch.txt\")]' '$${kind_config}'"
+    run_as_user "yq -i '.nodes[0].kubeadmConfigPatches = ((.nodes[0].kubeadmConfigPatches // []) | map(select(. != load_str(\"/tmp/kubeadm-patch.txt\"))) + [load_str(\"/tmp/kubeadm-patch.txt\")])' '$${kind_config}'"
     run_as_user "yq -i '.nodes += [{\"role\": \"worker\", \"labels\": {\"stateful\": \"true\"}}, {\"role\": \"worker\"}] | .nodes |= unique_by(.role + (.labels.stateful // \"\"))' '$${kind_config}'"
 
     rm -f /tmp/kubeadm-patch.txt
   fi
+}
+
+patch_coredns_for_domain() {
+  local base_domain="$${PLATFORM_MESH_BASE_DOMAIN}"
+  local traefik_ip
+
+  echo "Patching CoreDNS so $${base_domain} resolves inside the cluster..."
+
+  traefik_ip="$(run_as_user "kubectl get svc traefik -n default -o jsonpath='{.spec.clusterIP}'" 2>/dev/null || true)"
+
+  if [[ -z "$${traefik_ip}" ]]; then
+    echo "Warning: traefik service not found. Skipping CoreDNS patch."
+    return 0
+  fi
+
+  run_as_user "kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}'" > /tmp/coredns-corefile
+
+  if grep -q "$${base_domain}" /tmp/coredns-corefile; then
+    echo "CoreDNS already has an entry for $${base_domain}. Skipping."
+    rm -f /tmp/coredns-corefile
+    return 0
+  fi
+
+  sed -i "/kubernetes cluster.local/i\\
+\\    hosts {\\
+\\        $${traefik_ip} $${base_domain}\\
+\\        fallthrough\\
+\\    }" /tmp/coredns-corefile
+
+  run_as_user "kubectl -n kube-system create configmap coredns --from-file=Corefile=/tmp/coredns-corefile --dry-run=client -o yaml | kubectl apply -f -"
+  rm -f /tmp/coredns-corefile
+
+  run_as_user "kubectl -n kube-system rollout restart deployment coredns"
+  echo "CoreDNS patched. $${base_domain} -> $${traefik_ip}"
 }
 
 patch_platform_mesh_cr() {
@@ -350,35 +472,208 @@ patch_platform_mesh_cr() {
     run_as_user "yq -i '.spec.values.keycloak.values.postgresql.primary.nodeSelector = {\"stateful\": \"true\"}' '$${pm_cr}'"
     run_as_user "yq -i '.spec.values.openfga.values.nodeSelector = {\"stateful\": \"true\"}' '$${pm_cr}'"
     run_as_user "yq -i '.spec.values.openfga.values.postgresql.primary.nodeSelector = {\"stateful\": \"true\"}' '$${pm_cr}'"
+    run_as_user "yq -i '.spec.values.\"security-operator\".values.hostAliases.entries = [{\"hostnames\": [\"localhost\", \"$${PLATFORM_MESH_BASE_DOMAIN}\"], \"ip\": \"$${TRAEFIK_CLUSTER_IP}\"}]' '$${pm_cr}'"
   fi
 }
 
-main() {
+patch_platform_mesh_domain_references() {
+  local files
+
+  if [[ "$${PLATFORM_MESH_BASE_DOMAIN}" == "portal.localhost" ]]; then
+    echo "Using upstream portal.localhost domain. Skipping domain rewrite."
+    return 0
+  fi
+
+  files="$(run_as_user "cd '$${PLATFORM_MESH_HOME}' && rg -l --glob '*.sh' --glob '*.yaml' --glob '*.yml' 'portal\\.localhost' local-setup || true")"
+
+  if [[ -z "$${files}" ]]; then
+    echo "No portal.localhost references found under local-setup."
+    return 0
+  fi
+
+  echo "Replacing portal.localhost references across Platform Mesh local-setup sources..."
+  while IFS= read -r file; do
+    [[ -z "$${file}" ]] && continue
+    run_as_user "sed -i 's/portal\.localhost/$${PLATFORM_MESH_BASE_DOMAIN}/g' '$${PLATFORM_MESH_HOME}/$${file}'"
+  done <<<"$${files}"
+}
+
+validate_platform_mesh_source_tree() {
+  local remaining_refs
+  local cert_file="$${PLATFORM_MESH_HOME}/local-setup/certs/cert.crt"
+
+  if [[ "$${PLATFORM_MESH_BASE_DOMAIN}" == "portal.localhost" ]]; then
+    if [[ -f "$${cert_file}" ]]; then
+      if ! run_as_user "openssl x509 -in '$${cert_file}' -text -noout | grep -Fq 'DNS:$${PLATFORM_MESH_BASE_DOMAIN}'"; then
+        echo "Error: mkcert certificate does not include $${PLATFORM_MESH_BASE_DOMAIN}." >&2
+        exit 1
+      fi
+    fi
+    return 0
+  fi
+
+  remaining_refs="$(run_as_user "cd '$${PLATFORM_MESH_HOME}' && rg -n --glob '*.sh' --glob '*.yaml' --glob '*.yml' 'portal\\.localhost' local-setup || true")"
+  if [[ -n "$${remaining_refs}" ]]; then
+    echo "Error: portal.localhost references remain in Platform Mesh sources:" >&2
+    printf '%s\n' "$${remaining_refs}" >&2
+    exit 1
+  fi
+
+  if [[ -f "$${cert_file}" ]]; then
+    if ! run_as_user "openssl x509 -in '$${cert_file}' -text -noout | grep -Fq 'DNS:$${PLATFORM_MESH_BASE_DOMAIN}'"; then
+      echo "Error: mkcert certificate does not include $${PLATFORM_MESH_BASE_DOMAIN}." >&2
+      exit 1
+    fi
+
+    if run_as_user "openssl x509 -in '$${cert_file}' -text -noout | grep -Fq 'portal.localhost'"; then
+      echo "Error: mkcert certificate still includes portal.localhost." >&2
+      exit 1
+    fi
+  fi
+}
+
+validate_runtime_configuration() {
+  local traefik_ip
+  local coredns_corefile
+  local httproute_refs
+  local gateway_refs
+
+  traefik_ip="$(run_as_user "kubectl get svc traefik -n default -o jsonpath='{.spec.clusterIP}'" 2>/dev/null || true)"
+  if [[ -z "$${traefik_ip}" ]]; then
+    echo "Error: traefik service is missing after bootstrap." >&2
+    exit 1
+  fi
+
+  if [[ "$${traefik_ip}" != "$${TRAEFIK_CLUSTER_IP}" ]]; then
+    echo "Error: traefik ClusterIP is $${traefik_ip}, expected $${TRAEFIK_CLUSTER_IP}. The bootstrap assumes a pinned traefik service IP for hostAliases." >&2
+    exit 1
+  fi
+
+  coredns_corefile="$(run_as_user "kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}'" 2>/dev/null || true)"
+  if [[ "$${coredns_corefile}" != *"$${PLATFORM_MESH_BASE_DOMAIN}"* ]]; then
+    echo "Error: CoreDNS does not contain an entry for $${PLATFORM_MESH_BASE_DOMAIN}." >&2
+    exit 1
+  fi
+
+  if [[ "$${PLATFORM_MESH_BASE_DOMAIN}" == "portal.localhost" ]]; then
+    return 0
+  fi
+
+  if run_as_user "kubectl api-resources --api-group=gateway.networking.k8s.io | grep -Fq httproutes"; then
+    httproute_refs="$(run_as_user "kubectl get httproutes.gateway.networking.k8s.io -A -o yaml 2>/dev/null | grep -n 'portal\\.localhost' || true")"
+    if [[ -n "$${httproute_refs}" ]]; then
+      echo "Error: live HTTPRoutes still reference portal.localhost:" >&2
+      printf '%s\n' "$${httproute_refs}" >&2
+      exit 1
+    fi
+  fi
+
+  if run_as_user "kubectl api-resources --api-group=gateway.networking.k8s.io | grep -Fq gateways"; then
+    gateway_refs="$(run_as_user "kubectl get gateways.gateway.networking.k8s.io -A -o yaml 2>/dev/null | grep -n 'portal\\.localhost' || true")"
+    if [[ -n "$${gateway_refs}" ]]; then
+      echo "Error: live Gateways still reference portal.localhost:" >&2
+      printf '%s\n' "$${gateway_refs}" >&2
+      exit 1
+    fi
+  fi
+}
+
+ensure_platform_mesh_root() {
+  install -d -o "$${VM_USER}" -g "$${VM_USER}" "$${PLATFORM_MESH_ROOT}"
+  chown -R "$${VM_USER}:$${VM_USER}" "$${PLATFORM_MESH_ROOT}"
+}
+
+ensure_platform_mesh_repo() {
+  if [[ -d "$${PLATFORM_MESH_HOME}/.git" ]]; then
+    echo "Platform Mesh repo already cloned."
+    return 0
+  fi
+
+  run_as_user "git clone https://github.com/platform-mesh/helm-charts.git '$${PLATFORM_MESH_HOME}'"
+}
+
+checkout_platform_mesh_repo() {
+  run_as_user "cd '$${PLATFORM_MESH_HOME}' && git fetch --tags --force && git checkout '$${PLATFORM_MESH_VERSION}'"
+}
+
+platform_mesh_cluster_ready() {
+  run_as_user "kubectl get nodes >/dev/null 2>&1"
+}
+
+ensure_platform_mesh_started() {
+  if platform_mesh_cluster_ready; then
+    echo "Platform Mesh cluster already reachable. Skipping startup."
+    return 0
+  fi
+
+  run_as_user "bash /home/$${VM_USER}/start-platform-mesh.sh"
+}
+
+sync_team_access() {
+  run_as_user "bash '$${TEAM_RBAC_SYNC_SCRIPT}'"
+}
+
+install_bootstrap_tools() {
   install_kubectl
   install_kind
   install_helm
   install_yq
+}
+
+configure_host_environment() {
   configure_shell
   configure_podman
+}
 
-  install -d -o "$${VM_USER}" -g "$${VM_USER}" "$${PLATFORM_MESH_ROOT}"
-  chown -R "$${VM_USER}:$${VM_USER}" "$${PLATFORM_MESH_ROOT}"
+main() {
+  ensure_bootstrap_state_dir
 
-  if [[ ! -d "$${PLATFORM_MESH_HOME}/.git" ]]; then
-    run_as_user "git clone https://github.com/platform-mesh/helm-charts.git '$${PLATFORM_MESH_HOME}'"
+  if [[ -f "$${BOOTSTRAP_DONE_MARKER}" ]]; then
+    if platform_mesh_cluster_ready; then
+      echo "Bootstrap already completed on $(cat "$${BOOTSTRAP_DONE_MARKER}"). Skipping."
+      return 0
+    fi
+
+    echo "Bootstrap completion marker exists, but the cluster is not reachable. Resuming."
+    rm -f "$${BOOTSTRAP_DONE_MARKER}"
   fi
 
-  run_as_user "cd '$${PLATFORM_MESH_HOME}' && git fetch --tags --force && git checkout '$${PLATFORM_MESH_VERSION}'"
+  install_cloudflared
+  run_stage_once "install-tools" install_bootstrap_tools
+
+  configure_host_environment
+  mark_stage_done "configure-host"
+
+  ensure_platform_mesh_root
+  mark_stage_done "prepare-platform-mesh-root"
+
+  ensure_platform_mesh_repo
+  mark_stage_done "clone-platform-mesh-repo"
+
+  checkout_platform_mesh_repo
 
   patch_kind_config
+  patch_platform_mesh_domain_references
   patch_platform_mesh_cr
   write_start_script
   write_team_access_script
 
-  run_as_user "bash /home/$${VM_USER}/start-platform-mesh.sh"
-  run_as_user "bash '$${TEAM_RBAC_SYNC_SCRIPT}'"
+  ensure_platform_mesh_started
+  mark_stage_done "platform-mesh-started"
 
-  wall "Platform Mesh cluster provisioned and ready! You can now access the onboarding portal at https://portal.localhost:8443"
+  patch_coredns_for_domain
+  mark_stage_done "coredns-patched"
+
+  validate_platform_mesh_source_tree
+  validate_runtime_configuration
+  mark_stage_done "runtime-validated"
+
+  sync_team_access
+  mark_stage_done "team-access-synced"
+
+  date -Is >"$${BOOTSTRAP_DONE_MARKER}"
+
+  wall "Platform Mesh cluster provisioned and ready! You can now access the onboarding portal at https://$${PLATFORM_MESH_BASE_DOMAIN}:8443"
 }
 
 main "$@"

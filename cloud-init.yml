@@ -28,6 +28,7 @@ packages:
   - unzip
   - htop
   - net-tools
+  - openssl
 
 write_files:
   - path: /etc/sysctl.d/99-inotify.conf

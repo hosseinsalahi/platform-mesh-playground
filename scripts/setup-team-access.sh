@@ -49,9 +49,9 @@ team_kubeconfig="$HOME/.kube/platform-mesh-team.kubeconfig"
 service_account_namespace="default"
 service_account_name="platform-mesh-team"
 token_secret_name="platform-mesh-team-token"
-rolebinding_name="platform-mesh-team-view"
+rolebinding_name="platform-mesh-team-admin"
 legacy_rolebinding_name="platform-mesh-team-edit"
-role_name="view"
+role_name="admin"
 cluster_role_name="platform-mesh-team-namespace-reader"
 cluster_role_binding_name="platform-mesh-team-namespace-reader"
 excluded_namespace_pattern='^(kube-system|kube-public|kube-node-lease)$'
@@ -82,6 +82,9 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["*"]
 MANIFEST
 
 cat <<MANIFEST | kubectl_admin apply -f -
@@ -172,6 +175,8 @@ cat <<EOF
 Restricted team kubeconfig created and copied to:
   $local_kubeconfig_path
 
-This kubeconfig uses a dedicated service account bound to the built-in view role
-in non-system namespaces. It does not grant Kubernetes node API access.
+This kubeconfig uses a dedicated service account bound to the built-in admin role
+in non-system namespaces, allowing users to add, edit, and delete resources.
+It also grants cluster-wide access to CustomResourceDefinitions (CRDs).
+It does not grant Kubernetes node API access or access to system namespaces.
 EOF
