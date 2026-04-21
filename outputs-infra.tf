@@ -20,5 +20,5 @@ output "warp_private_route_cidr" {
 
 output "admin_warp_kubeconfig_command" {
   description = "Admin-only command to download and prepare the VM user's full-access WARP-compatible kubeconfig"
-  value       = "scp ${var.vm_user}@${scaleway_instance_ip.public.address}:/home/${var.vm_user}/.kube/config ./kind.kubeconfig && perl -0pi -e 's/127\\.0\\.0\\.1:6443/${local.private_ip}:6443/g' ./kind.kubeconfig && export KUBECONFIG=$(pwd)/kind.kubeconfig"
+  value       = "scp ${var.vm_user}@${scaleway_instance_ip.public.address}:/home/${var.vm_user}/.kube/config ./kind.kubeconfig && perl -0pi -e 's#server: https://127.0.0.1:6443#server: https://${local.private_ip}:6443#g' ./kind.kubeconfig && export KUBECONFIG=$(pwd)/kind.kubeconfig"
 }

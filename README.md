@@ -160,7 +160,7 @@ Admins can still use the full-access kubeconfig if needed. Once the bootstrap fi
 ```bash
 # Example command from 'terraform output admin_warp_kubeconfig_command'
 scp naira@<PUBLIC_IP>:/home/naira/.kube/config ./kind.kubeconfig
-perl -0pi -e 's/127\.0\.0\.1:6443/<PRIVATE_IP>:6443/g' ./kind.kubeconfig
+perl -0pi -e 's#server: https://127.0.0.1:6443#server: https://<PRIVATE_IP>:6443#g' ./kind.kubeconfig
 export KUBECONFIG=$(pwd)/kind.kubeconfig
 
 # Test direct, secure access (No warnings!)
@@ -174,6 +174,30 @@ The default portal workflow is local port-forwarding plus the VM-generated root 
 - Start a local forward with `kubectl --kubeconfig ./platform-mesh-team.kubeconfig -n default port-forward svc/traefik 8443:8443`.
 - Open `https://portal.localhost:8443`.
 - Import the PEM from the `scp` command printed by `./scripts/onboarding.sh` into your workstation trust store if your browser does not trust the portal certificate yet.
+
+#### Why `portal.localhost` Requires Port-Forwarding
+
+The default portal hostname is `portal.localhost`. On macOS, adding a DNS or `/etc/hosts` entry does not make `portal.localhost` behave like a normal remote hostname. Names under `localhost` are treated as loopback on the local machine, so `portal.localhost` resolves to your own computer, not the VM.
+
+Because of that, the supported access method is local `kubectl port-forward`:
+
+```bash
+kubectl --kubeconfig ./platform-mesh-team.kubeconfig -n default port-forward svc/traefik 8443:8443
+```
+
+Then open:
+
+```text
+https://portal.localhost:8443
+```
+
+This works because your browser connects to port `8443` on your own machine, and `kubectl` forwards that traffic into the cluster's Traefik service.
+
+This means:
+- `/etc/hosts` is not needed for `portal.localhost`
+- private DNS is not needed for the default setup
+- each user accesses the portal through their own local port-forward
+- the portal is only reachable while the port-forward session is running
 
 If you choose a custom shared hostname instead, set `platform_mesh_base_domain` to that DNS name and map it through your preferred private DNS path.
 
