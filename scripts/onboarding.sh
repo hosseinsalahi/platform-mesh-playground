@@ -41,9 +41,34 @@ if [[ -z "$vm_user" ]]; then
 fi
 
 ssh_target="${vm_user}@${public_ip}"
-warp_portal_hosts_entry="${private_ip} portal.localhost"
+warp_portal_domain="$(output_raw "warp_portal_url" | sed -nE 's#^https://([^:]+):.*#\1#p')"
+warp_portal_hosts_entry="${private_ip} ${warp_portal_domain}"
 team_kubeconfig_copy_command="scp ${ssh_target}:/home/${vm_user}/.kube/platform-mesh-team.kubeconfig ./platform-mesh-team.kubeconfig"
 mkcert_root_ca_copy_command="scp ${ssh_target}:/home/${vm_user}/.local/share/mkcert/rootCA.pem ./platform-mesh-rootCA.pem"
+portal_port_forward_command="kubectl --kubeconfig ./platform-mesh-team.kubeconfig -n default port-forward svc/traefik 8443:8443"
+
+if [[ "${warp_portal_domain}" == *.localhost ]]; then
+  cat <<EOF
+Team onboarding
+
+1. Install Cloudflare One and enroll in your existing Zero Trust WARP flow.
+2. Connect WARP and verify that this route is active:
+   ${warp_private_route_cidr}
+
+3. An admin should retrieve and securely distribute the restricted team kubeconfig:
+   ${team_kubeconfig_copy_command}
+
+4. Trust the portal certificate locally if your browser warns:
+   ${mkcert_root_ca_copy_command}
+
+5. Start a local port-forward to Traefik:
+   ${portal_port_forward_command}
+
+6. Open the portal:
+   ${warp_portal_url}
+EOF
+  exit 0
+fi
 
 cat <<EOF
 Team onboarding

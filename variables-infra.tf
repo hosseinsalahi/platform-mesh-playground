@@ -25,6 +25,27 @@ variable "platform_mesh_version" {
   default     = "0.2.0"
 }
 
+variable "cloudflare_tunnel_token" {
+  description = "Cloudflare Tunnel token used to authenticate cloudflared on the VM. If provided, the tunnel will be installed automatically on boot."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "platform_mesh_base_domain" {
+  description = "Base domain used for the Platform Mesh portal and its subdomains."
+  type        = string
+  default     = "portal.localhost"
+
+  validation {
+    condition = (
+      length(var.platform_mesh_base_domain) <= 253 &&
+      length(regexall("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\\.([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?))+$", var.platform_mesh_base_domain)) > 0
+    )
+    error_message = "platform_mesh_base_domain must be a valid DNS hostname, for example portal.localhost or portal.platform-mesh.test."
+  }
+}
+
 variable "scaleway_instance_type" {
   description = "Scaleway instance type for the VM."
   type        = string

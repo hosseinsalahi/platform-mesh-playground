@@ -47,8 +47,10 @@ resource "scaleway_instance_server" "vm" {
 
   cloud_init = templatefile("${path.module}/cloud-init.yml", {
     bootstrap_script = templatefile("${path.module}/bootstrap.sh.tftpl", {
-      platform_mesh_version = var.platform_mesh_version
-      vm_user               = var.vm_user
+      platform_mesh_version     = var.platform_mesh_version
+      platform_mesh_base_domain = var.platform_mesh_base_domain
+      cloudflare_tunnel_token   = var.cloudflare_tunnel_token
+      vm_user                   = var.vm_user
     })
     ssh_public_key = var.ssh_public_key
     vm_user        = var.vm_user
