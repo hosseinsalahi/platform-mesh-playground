@@ -1,0 +1,289 @@
+# Terraform: plan on pull requests, apply on main.
+# State backend: Scaleway S3-compatible (no native locking). Apply jobs use a
+# repo-wide concurrency group so only one writer runs at a time.
+
+name: Terraform
+
+on:
+  pull_request:
+    paths:
+      - "**.tf"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "**.tf"
+      - ".github/workflows/terraform.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: terraform-plan-${{ github.head_ref }}
+      cancel-in-progress: true
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCW_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCW_SECRET_KEY }}
+      AWS_REGION: ${{ vars.TF_STATE_REGION }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      SCW_ACCESS_KEY: ${{ secrets.SCW_ACCESS_KEY }}
+      SCW_SECRET_KEY: ${{ secrets.SCW_SECRET_KEY }}
+      SCW_DEFAULT_PROJECT_ID: ${{ secrets.SCW_DEFAULT_PROJECT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Export Terraform variables
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.TF_VAR_SSH_PUBLIC_KEY }}
+          SSH_ALLOWED_CIDR: ${{ secrets.TF_VAR_SSH_ALLOWED_CIDR }}
+          CF_TUNNEL_TOKEN: ${{ secrets.TF_VAR_CLOUDFLARE_TUNNEL_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.TF_VAR_CLOUDFLARE_ACCOUNT_ID }}
+          CF_TUNNEL_ID: ${{ secrets.TF_VAR_CLOUDFLARE_TUNNEL_ID }}
+          CF_TEAM_DOMAINS: ${{ secrets.TF_VAR_CLOUDFLARE_TEAM_EMAIL_DOMAINS }}
+          CF_TEAM_EMAILS: ${{ secrets.TF_VAR_CLOUDFLARE_TEAM_EMAILS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SSH_PUBLIC_KEY}" ] || [ -z "${SSH_ALLOWED_CIDR}" ]; then
+            echo "Required secrets TF_VAR_SSH_PUBLIC_KEY and TF_VAR_SSH_ALLOWED_CIDR must be set."
+            exit 1
+          fi
+          {
+            echo "TF_VAR_ssh_public_key<<__TF_VAR_EOF__"
+            echo "${SSH_PUBLIC_KEY}"
+            echo "__TF_VAR_EOF__"
+            echo "TF_VAR_ssh_allowed_cidr=${SSH_ALLOWED_CIDR}"
+          } >> "${GITHUB_ENV}"
+          if [ -n "${CF_TUNNEL_TOKEN}" ]; then
+            {
+              echo "TF_VAR_cloudflare_tunnel_token<<__TF_VAR_EOF__"
+              echo "${CF_TUNNEL_TOKEN}"
+              echo "__TF_VAR_EOF__"
+            } >> "${GITHUB_ENV}"
+          fi
+          if [ -n "${CF_ACCOUNT_ID}" ]; then
+            echo "TF_VAR_cloudflare_account_id=${CF_ACCOUNT_ID}" >> "${GITHUB_ENV}"
+          fi
+          if [ -n "${CF_TUNNEL_ID}" ]; then
+            echo "TF_VAR_cloudflare_tunnel_id=${CF_TUNNEL_ID}" >> "${GITHUB_ENV}"
+          fi
+          if [ -n "${CF_TEAM_DOMAINS}" ]; then
+            echo "TF_VAR_cloudflare_team_email_domains=${CF_TEAM_DOMAINS}" >> "${GITHUB_ENV}"
+          fi
+          if [ -n "${CF_TEAM_EMAILS}" ]; then
+            echo "TF_VAR_cloudflare_team_emails=${CF_TEAM_EMAILS}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          # 1.6.0 ignored some skip_* flags with custom S3 endpoints; keep >= 1.6.1.
+          terraform_version: "1.6.6"
+          terraform_wrapper: false
+
+      - name: Terraform format
+        run: terraform fmt -check -recursive
+
+      - name: Write backend config
+        run: |
+          cat > backend-config.ci.hcl <<EOF
+          bucket = "${{ vars.TF_STATE_BUCKET }}"
+          key    = "${{ vars.TF_STATE_KEY }}"
+          region = "${{ vars.TF_STATE_REGION }}"
+
+          endpoints = {
+            s3 = "${{ vars.TF_STATE_S3_ENDPOINT }}"
+          }
+
+          skip_credentials_validation = true
+          skip_requesting_account_id  = true
+          skip_metadata_api_check     = true
+          skip_region_validation      = true
+          use_path_style              = true
+          EOF
+
+      - name: Terraform init
+        run: terraform init -input=false -backend-config=backend-config.ci.hcl
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        id: plan
+        run: |
+          set -euo pipefail
+          terraform plan -no-color -input=false -out=tfplan
+          terraform show -no-color tfplan > tf-plan.txt
+
+      - name: Job summary
+        if: always() && steps.plan.outcome != 'skipped'
+        run: |
+          {
+            echo "## Terraform plan"
+            echo ""
+            echo '```'
+            head -c 120000 tf-plan.txt || true
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Post plan to PR
+        if: always() && steps.plan.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require("fs");
+            const marker = "<!-- terraform-plan -->";
+            let plan = "";
+            try {
+              plan = fs.readFileSync("tf-plan.txt", "utf8");
+            } catch (e) {
+              plan = "(plan file missing)";
+            }
+            const max = 55000;
+            if (plan.length > max) {
+              plan = plan.slice(0, max) + "\n\n... (truncated; see workflow summary / logs for full output)\n";
+            }
+            const body =
+              marker +
+              "\n## Terraform plan\n\n" +
+              "<details><summary>Expand</summary>\n\n" +
+              "```terraform\n" +
+              plan +
+              "\n```\n\n" +
+              "</details>\n";
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+
+            let commentId = null;
+            for (const c of comments) {
+              if (c.body && c.body.includes(marker)) {
+                commentId = c.id;
+                break;
+              }
+            }
+
+            if (commentId) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: commentId,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  apply:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: terraform-state-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCW_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCW_SECRET_KEY }}
+      AWS_REGION: ${{ vars.TF_STATE_REGION }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      SCW_ACCESS_KEY: ${{ secrets.SCW_ACCESS_KEY }}
+      SCW_SECRET_KEY: ${{ secrets.SCW_SECRET_KEY }}
+      SCW_DEFAULT_PROJECT_ID: ${{ secrets.SCW_DEFAULT_PROJECT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Export Terraform variables
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.TF_VAR_SSH_PUBLIC_KEY }}
+          SSH_ALLOWED_CIDR: ${{ secrets.TF_VAR_SSH_ALLOWED_CIDR }}
+          CF_TUNNEL_TOKEN: ${{ secrets.TF_VAR_CLOUDFLARE_TUNNEL_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.TF_VAR_CLOUDFLARE_ACCOUNT_ID }}
+          CF_TUNNEL_ID: ${{ secrets.TF_VAR_CLOUDFLARE_TUNNEL_ID }}
+          CF_TEAM_DOMAINS: ${{ secrets.TF_VAR_CLOUDFLARE_TEAM_EMAIL_DOMAINS }}
+          CF_TEAM_EMAILS: ${{ secrets.TF_VAR_CLOUDFLARE_TEAM_EMAILS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SSH_PUBLIC_KEY}" ] || [ -z "${SSH_ALLOWED_CIDR}" ]; then
+            echo "Required secrets TF_VAR_SSH_PUBLIC_KEY and TF_VAR_SSH_ALLOWED_CIDR must be set."
+            exit 1
+          fi
+          {
+            echo "TF_VAR_ssh_public_key<<__TF_VAR_EOF__"
+            echo "${SSH_PUBLIC_KEY}"
+            echo "__TF_VAR_EOF__"
+            echo "TF_VAR_ssh_allowed_cidr=${SSH_ALLOWED_CIDR}"
+          } >> "${GITHUB_ENV}"
+          if [ -n "${CF_TUNNEL_TOKEN}" ]; then
+            {
+              echo "TF_VAR_cloudflare_tunnel_token<<__TF_VAR_EOF__"
+              echo "${CF_TUNNEL_TOKEN}"
+              echo "__TF_VAR_EOF__"
+            } >> "${GITHUB_ENV}"
+          fi
+          if [ -n "${CF_ACCOUNT_ID}" ]; then
+            echo "TF_VAR_cloudflare_account_id=${CF_ACCOUNT_ID}" >> "${GITHUB_ENV}"
+          fi
+          if [ -n "${CF_TUNNEL_ID}" ]; then
+            echo "TF_VAR_cloudflare_tunnel_id=${CF_TUNNEL_ID}" >> "${GITHUB_ENV}"
+          fi
+          if [ -n "${CF_TEAM_DOMAINS}" ]; then
+            echo "TF_VAR_cloudflare_team_email_domains=${CF_TEAM_DOMAINS}" >> "${GITHUB_ENV}"
+          fi
+          if [ -n "${CF_TEAM_EMAILS}" ]; then
+            echo "TF_VAR_cloudflare_team_emails=${CF_TEAM_EMAILS}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.6"
+          terraform_wrapper: false
+
+      - name: Terraform format
+        run: terraform fmt -check -recursive
+
+      - name: Write backend config
+        run: |
+          cat > backend-config.ci.hcl <<EOF
+          bucket = "${{ vars.TF_STATE_BUCKET }}"
+          key    = "${{ vars.TF_STATE_KEY }}"
+          region = "${{ vars.TF_STATE_REGION }}"
+
+          endpoints = {
+            s3 = "${{ vars.TF_STATE_S3_ENDPOINT }}"
+          }
+
+          skip_credentials_validation = true
+          skip_requesting_account_id  = true
+          skip_metadata_api_check     = true
+          skip_region_validation      = true
+          use_path_style              = true
+          EOF
+
+      - name: Terraform init
+        run: terraform init -input=false -backend-config=backend-config.ci.hcl
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        run: terraform plan -no-color -input=false -out=tfplan
+
+      - name: Terraform apply
+        run: terraform apply -no-color -input=false -auto-approve tfplan
