@@ -57,7 +57,7 @@ variable "cloudflare_warp_auth_session_duration" {
 variable "cloudflare_manage_device_enrollment" {
   description = "Whether Terraform should manage the WARP device enrollment application. Default is false because most Zero Trust accounts already have one."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "cloudflare_manage_private_app_access" {
