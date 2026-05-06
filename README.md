@@ -1,301 +1,702 @@
-# Platform Mesh VM on Scaleway
+# Platform Mesh Playground
 
-This repository provisions a Debian VM on Scaleway and bootstraps the Platform Mesh local setup automatically on first boot.
+**Status:** Active
+**Maintainers:** Hossein Salahi, Marcel Frizler
 
-The stack is designed for secure team access through **Cloudflare WARP**. The VM keeps SSH public for administration, while the Kubernetes API and portal are intended to be reached through Cloudflare's private network routing instead of public inbound ports.
+---
 
-## What Terraform Provisions
+## 1. Overview
 
-- A Scaleway public IP and Private VPC interface.
-- A security group that allows SSH (22) and ICMP only.
-- A Debian Bookworm VM with Podman and Kind.
-- **Cloudflare Tunnel** integration for Private Network routing.
-- An optional Cloudflare-managed private route for the VM when `cloudflare_account_id` and `cloudflare_tunnel_id` are provided.
-- Terraform-managed Zero Trust enrollment and private app policies when team selectors are provided.
-- **Dynamic Certificate Injection**: The bootstrap script automatically detects the VM's private IP and injects it into the Kubernetes API server's certificate SANs, ensuring full TLS trust over WARP.
+Platform Mesh Playground is a Terraform-managed infrastructure project that provisions a centralized development and integration environment for the Naira project. It deploys a Scaleway VM running a multi-node Kubernetes cluster (Kind with Podman) and bootstraps the full [Platform Mesh](https://github.com/platform-mesh/helm-charts) stack automatically on first boot.
 
-## Required Inputs
+Team members access the environment securely through **Cloudflare WARP** (Zero Trust private networking) rather than exposing Kubernetes or the portal on the public internet. The only public-facing port is SSH (22) for administration.
 
-- `ssh_public_key`: SSH public key for the VM user.
-- `ssh_allowed_cidr`: CIDR allowed to reach SSH. Pass a specific admin source range such as `203.0.113.10/32`.
+### Why a Centralized VM Instead of Local Setup
 
-## Optional Inputs
+Platform Mesh requires a multi-node Kind cluster with Podman, CoreDNS patching, TLS certificate injection, and Traefik ingress. Replicating this reliably across macOS (Intel + Apple Silicon), Linux, and Windows WSL2 would be a significant maintenance burden. For a small team, a single centralized VM is more practical:
 
-- `vm_user`: Linux user created on the VM. Defaults to `naira`.
-- `platform_mesh_version`: Git ref to deploy from `platform-mesh/helm-charts`. Defaults to `0.2.0`.
-- `scaleway_instance_type`: Scaleway instance type for the VM. Defaults to `POP2-HC-16C-32G`.
-- `scaleway_instance_image`: Scaleway image for the VM. Defaults to `debian_bookworm`.
-- `scaleway_root_volume_size_gb`: Root disk size in GiB. Defaults to `100`.
-- `scaleway_instance_tags`: Tags applied to the VM. Defaults to `["platform-mesh","simple-vm"]`.
-- `cloudflare_account_id`: Cloudflare account ID. When paired with `cloudflare_tunnel_id`, Terraform will create the WARP private route automatically.
-- `cloudflare_tunnel_id`: Existing remotely-managed Cloudflare Tunnel UUID.
-- `cloudflare_team_email_domains`: Domains allowed to enroll devices and use the private apps.
-- `cloudflare_team_emails`: Explicit user emails allowed to enroll devices and use the private apps.
-- `cloudflare_team_access_group_ids`: Existing Access group IDs allowed to enroll devices and use the private apps.
-- `cloudflare_allowed_idp_ids`: Optional IdP IDs for the enrollment and private apps.
-- `cloudflare_manage_zero_trust_organization`: Whether Terraform should manage the account-level WARP auth settings needed for WARP-authenticated private apps. Defaults to `false` to avoid Terraform lifecycle warnings on the persistent Zero Trust organization object.
-- `cloudflare_warp_auth_session_duration`: Account-level WARP auth session duration. Defaults to `24h`.
-- `cloudflare_manage_team_warp_profile`: Whether Terraform should manage a team-specific WARP profile. Defaults to `true`.
-- `cloudflare_warp_profile_match`: Optional custom-profile match expression override. If unset, Terraform derives it from `cloudflare_team_emails` and `cloudflare_team_access_group_ids`.
-- `cloudflare_warp_profile_include_extra_hosts`: Extra hostnames required when you enable the custom WARP profile in Split Tunnel Include mode, typically your IdP hostnames and `<team>.cloudflareaccess.com`.
+- One environment to maintain, not N laptop variations
+- Consistent state across all team members
+- Dedicated resources (16 vCPUs / 32 GB RAM) without impacting developer laptops
+- Onboarding reduces to: install WARP, receive kubeconfig, connect
+- Cross-platform access is provided by the WARP client, not by running the cluster locally
 
-## Setup & Usage
+---
 
-### 1. Cloudflare Dashboard Configuration
-Before applying, make sure your Cloudflare Zero Trust tenant is ready for the team:
-- Create or reuse a remotely-managed `cloudflared` tunnel for this VM.
-- Keep the tunnel token outside your source code. You can pass it securely during apply using the `TF_VAR_cloudflare_tunnel_token` environment variable.
-- Export a Cloudflare API token with permission to manage Zero Trust apps, policies, devices, and tunnels.
-- If you do not configure team selectors in Terraform, define **device enrollment permissions** and private-network access manually in the dashboard.
-- The default portal hostname is `portal.localhost`, which works well with local `kubectl port-forward` access. If you want a clean shared portal hostname instead, publish a Cloudflare private hostname and set `platform_mesh_base_domain` to that DNS name.
+## 2. Architecture
 
-If you provide `cloudflare_account_id` and `cloudflare_tunnel_id`, Terraform will create the VM's `/32` private route automatically. If you also provide team selectors, Terraform will create:
-- An allow policy for the team.
-- The account-level WARP auth session setting required by WARP-authenticated private apps only if `cloudflare_manage_zero_trust_organization=true`.
-- A WARP enrollment application only if `cloudflare_manage_device_enrollment=true`.
-- Two private Access applications protecting `6443/tcp` and `8443/tcp`.
+```
+                        +---------------------------+
+                        |       Developer Laptop    |
+                        |  (macOS / Linux / WSL2)   |
+                        |                           |
+                        |  Cloudflare WARP client   |
+                        |  kubectl + team kubeconfig|
+                        +-------------|-------------+
+                                      |
+                              Cloudflare WARP
+                           (private /32 route)
+                                      |
+         +----------------------------|------------------------------+
+         |                  Scaleway VPC (fr-par)                    |
+         |                                                           |
+         |   +---------------------------------------------------+   |
+         |   |          Debian Bookworm VM (POP2-HC-16C-32G)     |   |
+         |   |                                                   |   |
+         |   |   cloudflared tunnel  <-- Cloudflare Tunnel       |   |
+         |   |                                                   |   |
+         |   |   Kind Cluster (Podman provider)                  |   |
+         |   |   +-------------------------------------------+   |   |
+         |   |   | Control Plane Node                        |   |   |
+         |   |   |   API Server :6443 (private IP in SANs)   |   |   |
+         |   |   |   CoreDNS (patched for base domain)       |   |   |
+         |   |   +-------------------------------------------+   |   |
+         |   |   | Worker Node 1          (label: stateful)  |   |   |
+         |   |   |   Keycloak, OpenFGA, PostgreSQL           |   |   |
+         |   |   +-------------------------------------------+   |   |
+         |   |   | Worker Node 2                             |   |   |
+         |   |   |   Application workloads                   |   |   |
+         |   |   +-------------------------------------------+   |   |
+         |   |   | Traefik Ingress        :8443 (portal)     |   |   |
+         |   |   |   ClusterIP: 10.96.188.4 (pinned)         |   |   |
+         |   |   +-------------------------------------------+   |   |
+         |   +---------------------------------------------------+   |
+         |                                                           |
+         +-----------------------------------------------------------+
 
-The team WARP profile is created by default when team selectors are present and `cloudflare_manage_team_warp_profile=true`. Terraform derives the profile match from `cloudflare_team_emails` and `cloudflare_team_access_group_ids`, unless you override it with `cloudflare_warp_profile_match`. The profile uses Split Tunnel Include mode for the VM route and automatically includes your Cloudflare team domain. Add any extra IdP hostnames you need in `cloudflare_warp_profile_include_extra_hosts`.
-
-Cloudflare Access policies support domain-based selectors, but the WARP device-profile match used here should be based on exact emails, group IDs, or an explicit `cloudflare_warp_profile_match` override. If you only pass `cloudflare_team_email_domains`, Terraform can still create the Access policy, but it will not be able to derive a valid device-profile match from domains alone.
-
-By default, this module assumes your Cloudflare account already has WARP authentication identity enabled with a valid WARP auth session duration. If you want Terraform to configure that account-level setting for you, explicitly add:
-
-```bash
--var='cloudflare_manage_zero_trust_organization=true'
+         Cloudflare Zero Trust
+         +-----------------------------------------------------------+
+         |  Tunnel Route:     <private-IP>/32                        |
+         |  Access Policy:    team emails / domains / groups         |
+         |  Private Apps:     :6443 (K8s API), :8443 (Portal)       |
+         |  WARP Profile:     team-scoped, include VM route          |
+         |  Device Enrollment: WARP app (optional, Terraform-managed)|
+         +-----------------------------------------------------------+
 ```
 
-If you previously enabled `cloudflare_zero_trust_organization` in this module and want to stop managing it cleanly, first set `cloudflare_manage_zero_trust_organization=false`, then remove it from local Terraform state:
+---
 
-```bash
-terraform state rm 'cloudflare_zero_trust_organization.current[0]'
+## 3. Infrastructure Components
+
+### 3.1 Scaleway Resources
+
+| Resource | Description |
+|---|---|
+| `scaleway_vpc_private_network.pn` | Private VPC network (`platform-mesh-priv-net`) for internal routing |
+| `scaleway_instance_ip.public` | Public IPv4 address for SSH administration |
+| `scaleway_instance_security_group.ssh_only` | Firewall: inbound SSH (TCP/22) from `ssh_allowed_cidr`, ICMP from anywhere; all other inbound dropped |
+| `scaleway_instance_server.vm` | Debian Bookworm VM (default: `POP2-HC-16C-32G`, 100 GB SBS root volume) with cloud-init bootstrap |
+
+### 3.2 Cloudflare Zero Trust Resources
+
+All Cloudflare resources are conditional — they are only created when `cloudflare_account_id` is provided.
+
+| Resource | Condition | Description |
+|---|---|---|
+| `cloudflare_zero_trust_tunnel_cloudflared_route.vm` | `account_id` + `tunnel_id` set | Private `/32` route through the Cloudflare Tunnel for the VM's private IP |
+| `cloudflare_zero_trust_access_policy.team` | Team selectors provided | Allow policy matching team emails, email domains, and/or Access group IDs |
+| `cloudflare_zero_trust_access_application.device_enrollment` | Team selectors + `manage_device_enrollment = true` | WARP enrollment application for team device registration |
+| `cloudflare_zero_trust_access_application.private_apps` | Team selectors + `manage_private_app_access = true` | Two private apps protecting TCP :6443 (K8s API) and :8443 (Portal), WARP-authenticated |
+| `cloudflare_zero_trust_device_custom_profile.team` | Team selectors + `manage_team_warp_profile = true` | Custom WARP device profile that routes the VM private IP through WARP with Split Tunnel Include mode |
+| `cloudflare_zero_trust_organization.current` | `manage_zero_trust_organization = true` | Account-level WARP auth session duration setting |
+
+### 3.3 Terraform State Backend
+
+State is stored remotely in Scaleway Object Storage (S3-compatible):
+
+| Setting | Value |
+|---|---|
+| Bucket | `naira-reply-tf-storage` |
+| Key | `simple-vm/terraform.tfstate` |
+| Region | `fr-par` |
+| Endpoint | `https://s3.fr-par.scw.cloud` |
+
+Scaleway Object Storage does not support state locking. Treat this backend as single-writer and avoid concurrent `terraform apply` runs.
+
+---
+
+## 4. Bootstrap Flow
+
+When the VM boots for the first time, cloud-init executes `bootstrap-platform-mesh`. The script is idempotent — each stage is tracked by marker files under `/var/log/platform-mesh-bootstrap.d/` and skipped on subsequent runs.
+
+```
+ cloud-init
+    |
+    v
+ install_cloudflared          -- installs + registers cloudflared tunnel service
+    |
+    v
+ install_bootstrap_tools      -- kubectl, kind (v0.31.0), helm (v3.14.3), yq (v4.43.1)
+    |                            all with SHA-256 checksum verification
+    v
+ configure_host_environment   -- shell aliases, podman rootless mode, lingering
+    |
+    v
+ ensure_platform_mesh_root    -- creates /opt/platform-mesh owned by vm_user
+    |
+    v
+ ensure_platform_mesh_repo    -- git clone platform-mesh/helm-charts
+    |
+    v
+ checkout_platform_mesh_repo  -- git checkout <platform_mesh_version>
+    |
+    v
+ patch_kind_config            -- injects private IP into API server SANs,
+    |                            binds ports to 0.0.0.0, adds worker nodes
+    v
+ patch_platform_mesh_*        -- rewrites portal.localhost to base domain,
+    |                            sets nodeSelectors, hostAliases
+    v
+ write_start_script           -- creates ~/start-platform-mesh.sh
+    |
+    v
+ write_team_access_script     -- creates ~/bin/sync-platform-mesh-team-access
+    |
+    v
+ ensure_platform_mesh_started -- runs Platform Mesh local-setup start.sh
+    |
+    v
+ patch_coredns_for_domain     -- adds base domain -> Traefik ClusterIP in CoreDNS
+    |
+    v
+ validate_*                   -- verifies source tree, TLS certs, CoreDNS,
+    |                            Traefik ClusterIP, HTTPRoutes, Gateways
+    v
+ sync_team_access             -- creates service account, RBAC, team kubeconfig
+    |
+    v
+ DONE                         -- writes /var/log/platform-mesh-bootstrap.done
 ```
 
-### 2. Deploy
-```bash
-export CLOUDFLARE_API_TOKEN=<CLOUDFLARE_API_TOKEN>
+**Logs:** All bootstrap output goes to `/var/log/platform-mesh-bootstrap.log`.
 
-terraform apply -var-file=dev.tfvars
-```
+### Key Bootstrap Behaviors
 
-Populate `dev.tfvars` with your local values. This repo ignores that file so you can keep machine-specific settings there, including your SSH public key, current `ssh_allowed_cidr`, Cloudflare account/tunnel IDs, and team selectors.
+- **Idempotent stages:** Each major stage writes a `.done` marker. Re-running the bootstrap skips completed stages.
+- **Internet connectivity wait:** Up to 60 seconds of retry before proceeding.
+- **Private IP detection:** Scans `hostname -I` output for RFC 1918 addresses with a 60-second retry loop.
+- **Pinned Traefik ClusterIP:** `10.96.188.4` — hardcoded and validated post-bootstrap. Must match the Platform Mesh CR.
+- **Domain rewriting:** If `platform_mesh_base_domain` differs from `portal.localhost`, all references in the Platform Mesh `local-setup/` tree are rewritten with `sed`.
+- **Certificate validation:** Verifies that the mkcert certificate covers the configured base domain and does not contain stale `portal.localhost` entries.
 
-Terraform fails fast on ambiguous Cloudflare combinations:
-- `cloudflare_account_id` and `cloudflare_tunnel_id` must be set together.
-- Domain-only selectors are not enough to manage the team WARP profile unless you also set `cloudflare_warp_profile_match`.
+---
 
-If you provide `TF_VAR_cloudflare_tunnel_token` at apply time, bootstrap will install and start `cloudflared` automatically on first boot. If you leave that variable unset, Terraform will still provision the VM and Cloudflare resources, but you must install and configure `cloudflared` on the VM yourself.
+## 5. Security Model
 
-### Terraform State Backend
+### Network Security
 
-This repo is already configured to use the Terraform `s3` backend via `backend.tf`. The Scaleway Object Storage bucket must exist first, so create it in the separate sibling project under `../tfstate-bootstrap`:
+| Port | Protocol | Access | Purpose |
+|---|---|---|---|
+| 22 | TCP | `ssh_allowed_cidr` only | SSH administration (admin only) |
+| 6443 | TCP | Cloudflare WARP only | Kubernetes API server |
+| 8443 | TCP | Cloudflare WARP only | Platform Mesh portal (Traefik) |
+| ICMP | ICMP | Public | Ping / diagnostics |
+| All other inbound | * | Dropped | Default deny |
+
+### Identity and Access
+
+| Layer | Mechanism |
+|---|---|
+| Network access | Cloudflare WARP enrollment required; traffic routed through encrypted tunnel |
+| Application access | Cloudflare Access policies scoped to team emails, email domains, or Access groups |
+| Kubernetes RBAC (admin) | Full cluster-admin via VM user's `~/.kube/config` — SSH required |
+| Kubernetes RBAC (team) | Dedicated `platform-mesh-team` service account with `admin` role in non-system namespaces; cluster-wide CRD access; no node API or system namespace access |
+
+### Sensitive Data
+
+| Item | Location | Protection |
+|---|---|---|
+| Cloudflare Tunnel token | Terraform state, VM cloud-init user-data | Marked `sensitive` in Terraform; should be passed via `TF_VAR_cloudflare_tunnel_token`, never committed to `.tfvars` |
+| SSH private key | Operator's local machine | Never stored in the repo; only the public key is in `dev.tfvars` |
+| Team kubeconfig | VM at `~/.kube/platform-mesh-team.kubeconfig` | `chmod 0600`; distributed by admin via `scp` |
+| Admin kubeconfig | VM at `~/.kube/config` | Requires SSH to the VM |
+| Terraform state | Scaleway Object Storage (`naira-reply-tf-storage`) | Restrict bucket access; contains tunnel token and infrastructure secrets |
+
+---
+
+## 6. Prerequisites
+
+### For Administrators (deploying/managing the VM)
+
+| Tool | Purpose |
+|---|---|
+| Terraform >= 1.6 | Infrastructure provisioning |
+| Scaleway CLI or API credentials | `SCW_ACCESS_KEY`, `SCW_SECRET_KEY` for Terraform provider and S3 backend |
+| Cloudflare API token | Must have permissions for: Zero Trust apps, policies, devices, tunnels |
+| SSH key pair | Ed25519 recommended; public key goes into `ssh_public_key` variable |
+
+### For Team Members (using the environment)
+
+| Tool | Purpose |
+|---|---|
+| [Cloudflare WARP client](https://developers.cloudflare.com/cloudflare-one/connections/connect-devices/warp/download-warp/) | Private network access to the VM |
+| `kubectl` | Kubernetes interaction via team kubeconfig |
+| (Optional) `mkcert` root CA | Trust the portal TLS certificate locally |
+
+---
+
+## 7. Deployment Guide
+
+### 7.1 Bootstrap the State Backend (first time only)
 
 ```bash
 cd ../tfstate-bootstrap
 terraform init
-terraform apply -var='bucket_name=<globally-unique-bucket-name>'
-cd ../naira-playground
+terraform apply -var='bucket_name=naira-reply-tf-storage'
+cd ../simple-vm
 ```
 
-Then verify `scaleway.s3.tfbackend` points at that bucket and region, export your Scaleway credentials using the AWS-compatible variable names expected by Terraform's `s3` backend, and initialize or migrate the state:
+An example backend configuration file is provided at `scaleway.s3.tfbackend.example`. Copy it to a path outside version control (any `*.tfbackend` or `*.hcl` file is gitignored) and adjust the values for your environment.
+
+### 7.2 Configure Credentials
 
 ```bash
+# Scaleway — for both the provider and S3 backend
+export SCW_ACCESS_KEY="<your-access-key>"
+export SCW_SECRET_KEY="<your-secret-key>"
 export AWS_ACCESS_KEY_ID="$SCW_ACCESS_KEY"
 export AWS_SECRET_ACCESS_KEY="$SCW_SECRET_KEY"
+
+# Cloudflare
+export CLOUDFLARE_API_TOKEN="<your-api-token>"
+
+# Tunnel token (sensitive — never put in .tfvars)
+export TF_VAR_cloudflare_tunnel_token="<tunnel-token>"
+```
+
+### 7.3 Configure Variables
+
+Edit `dev.tfvars` with your local values:
+
+```hcl
+ssh_public_key   = "ssh-ed25519 AAAA..."
+ssh_allowed_cidr = "203.0.113.10/32"          # your current public IP
+
+cloudflare_account_id = "<account-id>"
+cloudflare_tunnel_id  = "<tunnel-uuid>"
+
+cloudflare_team_email_domains = ["company.com"]
+cloudflare_team_emails        = ["alice@company.com", "bob@company.com"]
+
+# Optional overrides
+# cloudflare_manage_device_enrollment       = true
+# cloudflare_manage_zero_trust_organization = true
+# platform_mesh_base_domain                 = "portal.example.com"
+# platform_mesh_version                     = "0.2.0"
+```
+
+`dev.tfvars` is in `.gitignore` and should never be committed.
+
+### 7.4 Initialize and Apply
+
+```bash
 terraform init -reconfigure -backend-config=scaleway.s3.tfbackend
+terraform plan -var-file=dev.tfvars
+terraform apply -var-file=dev.tfvars
 ```
 
-Keep `use_path_style = true` in the backend config for Scaleway Object Storage. Without it, Terraform may try bucket-style DNS names that do not resolve for this backend setup.
-
-Scaleway Object Storage is S3-compatible, but Scaleway documents that Terraform state stored through an AWS S3-compatible bucket does not currently have a supported locking mechanism. Treat this backend as single-writer and avoid concurrent `terraform apply` runs.
-
-If you are moving existing local state into the remote backend, use:
+### 7.5 Monitor Bootstrap Progress
 
 ```bash
-terraform init -migrate-state -reconfigure -backend-config=scaleway.s3.tfbackend
+ssh naira@$(terraform output -raw public_ip) "tail -f /var/log/platform-mesh-bootstrap.log"
 ```
 
-### GitHub Actions CI
+Bootstrap completes when you see:
 
-Use the workflow at [`.github/workflows/terraform.yml`](.github/workflows/terraform.yml) when the lab should be owned by automation instead of ad-hoc local applies.
+```
+Platform Mesh cluster provisioned and ready!
+```
 
-Behavior:
-
-- **Pull requests**: `terraform fmt -check`, `terraform init`, `terraform validate`, `terraform plan`. The rendered plan is posted to the PR as a collapsible comment (and repeated in the job summary); long plans are truncated in the comment with a pointer to logs/summary.
-- **Pushes to `main`**: the same checks, then `terraform plan -out=tfplan` and `terraform apply` using that plan file.
-- **Concurrency**: `main` applies use a single repository-wide concurrency group so two applies cannot run at once. PR plan jobs only cancel earlier runs on the same head branch. The Scaleway S3-compatible backend still has **no Terraform state locking**; treat CI as the single writer and **avoid manual `terraform apply` against the same remote state** while the pipeline is in use.
-
-Inputs are **not** read from `dev.tfvars` in CI. Configure GitHub **repository secrets** and **variables** (or use [`scripts/setup-github-secrets.sh`](scripts/setup-github-secrets.sh) with the GitHub CLI).
-
-**Repository variables** (non-secret; required for the remote backend in CI):
-
-| Variable | Purpose |
-| --- | --- |
-| `TF_STATE_BUCKET` | Scaleway Object Storage bucket name |
-| `TF_STATE_KEY` | State object key inside the bucket |
-| `TF_STATE_REGION` | Region string (e.g. `fr-par`) |
-| `TF_STATE_S3_ENDPOINT` | S3 API URL (e.g. `https://s3.fr-par.scw.cloud`) |
-
-**Repository secrets** (required unless noted optional):
-
-| Secret | Purpose |
-| --- | --- |
-| `SCW_ACCESS_KEY` | Scaleway API access key |
-| `SCW_SECRET_KEY` | Scaleway API secret key |
-| `SCW_DEFAULT_PROJECT_ID` | Default Scaleway project ID for the provider |
-| `TF_STATE_ACCESS_KEY` | Optional; S3 access key for the Terraform state bucket. Defaults to `SCW_ACCESS_KEY` if unset |
-| `TF_STATE_SECRET_KEY` | Optional; S3 secret key for the Terraform state bucket. Defaults to `SCW_SECRET_KEY` if unset |
-| `CLOUDFLARE_API_TOKEN` | Cloudflare API token for managed resources |
-| `TF_VAR_SSH_PUBLIC_KEY` | Value for Terraform variable `ssh_public_key` |
-| `TF_VAR_SSH_ALLOWED_CIDR` | Value for Terraform variable `ssh_allowed_cidr` |
-| `TF_VAR_CLOUDFLARE_TUNNEL_TOKEN` | Optional; same as `TF_VAR_cloudflare_tunnel_token` for bootstrap |
-| `TF_VAR_CLOUDFLARE_ACCOUNT_ID` | Optional; set together with tunnel id if managing Cloudflare routes |
-| `TF_VAR_CLOUDFLARE_TUNNEL_ID` | Optional; set together with account id |
-| `TF_VAR_CLOUDFLARE_TEAM_EMAIL_DOMAINS` | Optional; JSON list string, e.g. `["example.com"]` |
-| `TF_VAR_CLOUDFLARE_TEAM_EMAILS` | Optional; JSON list string, e.g. `["user@example.com"]` |
-
-The workflow exports these as `TF_VAR_<terraform_variable_name>` (for example `TF_VAR_cloudflare_tunnel_token` from `TF_VAR_CLOUDFLARE_TUNNEL_TOKEN`). Optional secrets are only exported when non-empty so Terraform keeps its defaults.
-
-**Bootstrap GitHub from your shell** (after `gh auth login`):
+### 7.6 Verify Deployment
 
 ```bash
-export SCW_ACCESS_KEY=...
-export SCW_SECRET_KEY=...
-export SCW_DEFAULT_PROJECT_ID=...
-export CLOUDFLARE_API_TOKEN=...
+# Check Terraform outputs
+terraform output
 
-# Optional when the state bucket uses separate S3 credentials:
-# export TF_STATE_ACCESS_KEY=...
-# export TF_STATE_SECRET_KEY=...
+# Test SSH connectivity
+ssh naira@$(terraform output -raw public_ip) "kubectl get nodes"
+```
 
-export TF_VAR_SSH_PUBLIC_KEY='ssh-ed25519 AAAA...'
-export TF_VAR_SSH_ALLOWED_CIDR='203.0.113.10/32'
+Expected output: 3 nodes (1 control-plane, 2 workers) in `Ready` state.
 
-export TF_STATE_BUCKET='your-bucket'
-export TF_STATE_KEY='naira-playground/terraform.tfstate'
-export TF_STATE_REGION='fr-par'
-export TF_STATE_S3_ENDPOINT='https://s3.fr-par.scw.cloud'
+---
 
-# Optional Cloudflare / team inputs (examples):
-# export TF_VAR_CLOUDFLARE_TUNNEL_TOKEN='...'
-# export TF_VAR_CLOUDFLARE_ACCOUNT_ID='...'
-# export TF_VAR_CLOUDFLARE_TUNNEL_ID='...'
-# export TF_VAR_CLOUDFLARE_TEAM_EMAIL_DOMAINS='["reply.com"]'
-# export TF_VAR_CLOUDFLARE_TEAM_EMAILS='["you@example.com"]'
+## 8. CI/CD Pipeline
 
+A GitHub Actions workflow (`.github/workflows/terraform.yml`) automates Terraform operations:
+
+| Trigger | Job | What it does |
+|---|---|---|
+| Pull request (`.tf` or workflow changes) | **plan** | `fmt -check`, `validate`, `plan`; posts the plan as a PR comment |
+| Push to `main` (`.tf` or workflow changes) | **apply** | `fmt -check`, `validate`, `plan`, `apply -auto-approve` |
+
+### Concurrency
+
+- **Plan jobs** use a per-branch concurrency group (`terraform-plan-<branch>`); a new push cancels any in-flight plan for the same branch.
+- **Apply jobs** use a repo-wide concurrency group (`terraform-state-<repo>`) with `cancel-in-progress: false`, so only one apply runs at a time (compensating for the lack of native state locking in Scaleway S3).
+
+### Required Secrets and Variables
+
+Configure these in the GitHub repository settings, or use the helper script:
+
+```bash
 ./scripts/setup-github-secrets.sh
 ```
 
-**Security**: if a real `cloudflare_tunnel_token` or API token was ever committed to `dev.tfvars` or history, **rotate** it before moving to GitHub secrets.
+The script reads values from your environment and populates them via the `gh` CLI.
 
-**Fork pull requests**: workflows triggered from forks do not receive repository secrets; plan jobs from forks will fail unless you use a different approval model.
+**Secrets:**
 
-A template for a local backend file (not committed; `*.tfbackend` is gitignored) lives at [`scaleway.s3.tfbackend.example`](scaleway.s3.tfbackend.example).
+| Secret | Required | Description |
+|---|---|---|
+| `SCW_ACCESS_KEY` | Yes | Scaleway API access key |
+| `SCW_SECRET_KEY` | Yes | Scaleway API secret key |
+| `SCW_DEFAULT_PROJECT_ID` | Yes | Scaleway default project ID |
+| `CLOUDFLARE_API_TOKEN` | Yes | Cloudflare API token with Zero Trust permissions |
+| `TF_STATE_ACCESS_KEY` | No | State backend access key (defaults to `SCW_ACCESS_KEY`) |
+| `TF_STATE_SECRET_KEY` | No | State backend secret key (defaults to `SCW_SECRET_KEY`) |
+| `TF_VAR_SSH_PUBLIC_KEY` | Yes | SSH public key for the VM user |
+| `TF_VAR_SSH_ALLOWED_CIDR` | Yes | CIDR allowed to reach SSH |
+| `TF_VAR_CLOUDFLARE_TUNNEL_TOKEN` | No | Cloudflare Tunnel token |
+| `TF_VAR_CLOUDFLARE_ACCOUNT_ID` | No | Cloudflare account ID |
+| `TF_VAR_CLOUDFLARE_TUNNEL_ID` | No | Cloudflare Tunnel UUID |
+| `TF_VAR_CLOUDFLARE_TEAM_EMAIL_DOMAINS` | No | JSON array of allowed email domains |
+| `TF_VAR_CLOUDFLARE_TEAM_EMAILS` | No | JSON array of allowed emails |
 
-If you do not want Terraform to manage Cloudflare resources, leave the Cloudflare Terraform inputs unset and configure the private route and private apps manually in Cloudflare. You can still install and configure `cloudflared` on the VM separately if you need tunnel-based routing.
+**Repository Variables:**
 
-To override the automatically-derived team-specific WARP profile, add variables like:
+| Variable | Description |
+|---|---|
+| `TF_STATE_BUCKET` | S3 bucket name for Terraform state |
+| `TF_STATE_KEY` | Object key for the state file |
+| `TF_STATE_REGION` | S3 region (e.g., `fr-par`) |
+| `TF_STATE_S3_ENDPOINT` | S3-compatible endpoint URL |
+
+---
+
+## 9. Team Onboarding Guide
+
+This section is intended for team members who need access to the environment. No SSH or Terraform access is required.
+
+### Step 1 — Install Cloudflare WARP
+
+Download and install the [Cloudflare WARP client](https://developers.cloudflare.com/cloudflare-one/connections/connect-devices/warp/download-warp/) for your platform.
+
+### Step 2 — Enroll Your Device
+
+Open the WARP client and enroll in the organization's Zero Trust tenant. Use your team email address when prompted. After enrollment, toggle WARP to **Connected**.
+
+### Step 3 — Receive Kubeconfig from Admin
+
+An administrator will securely send you the file `platform-mesh-team.kubeconfig`. Save it to a known location on your machine, for example `~/.kube/platform-mesh-team.kubeconfig`.
+
+Admins generate and distribute this file by running:
 
 ```bash
--var='cloudflare_warp_profile_match=identity.groups.id == "<ACCESS_GROUP_ID>"' \
--var='cloudflare_warp_profile_include_extra_hosts=["<team>.cloudflareaccess.com","<idp-hostname>"]'
+./scripts/setup-team-access.sh
+# or
+./scripts/onboarding.sh   # prints copy commands
 ```
 
-### 3. Onboard the Team with WARP
+### Step 4 — Trust the Portal Certificate
 
-Each team member should:
-- Install the Cloudflare One client.
-- Enroll their device into your Zero Trust organization through the WARP enrollment application Terraform created, or through your existing dashboard flow if you kept enrollment outside Terraform.
-- Connect WARP and confirm the route returned by `terraform output warp_private_route_cidr` is active.
-- Use the private apps only after their identity matches one of the Terraform-managed selectors.
-- Receive the restricted team kubeconfig from an admin; team members do not need SSH access to the VM.
+The portal uses a self-signed certificate generated by `mkcert` on the VM. To avoid browser warnings:
 
-To print the exact local steps from the current Terraform state, run:
+1. Ask an admin for the root CA file (`platform-mesh-rootCA.pem`).
+2. Import it into your OS trust store:
+   - **macOS:** `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain platform-mesh-rootCA.pem`
+   - **Linux (Debian/Ubuntu):** `sudo cp platform-mesh-rootCA.pem /usr/local/share/ca-certificates/platform-mesh-rootCA.crt && sudo update-ca-certificates`
+   - **Windows:** Double-click the `.pem` file and install to "Trusted Root Certification Authorities"
+
+### Step 5 — Access the Portal
+
+**If the base domain is `portal.localhost` (default):**
+
+Start a local port-forward:
 
 ```bash
-./scripts/onboarding.sh
+kubectl --kubeconfig ./platform-mesh-team.kubeconfig \
+  -n default port-forward svc/traefik 8443:8443
 ```
 
-If the VM already existed before this RBAC automation was added, install the restricted team access on the current VM with:
+Then open: `https://portal.localhost:8443`
+
+The portal is only reachable while the port-forward session is running. No `/etc/hosts` entry is needed — `portal.localhost` resolves to `127.0.0.1` by default on most systems.
+
+**If a custom base domain is configured:**
+
+Add a hosts entry on your workstation:
+
+```
+<private-ip>  <base-domain>
+```
+
+Then open: `https://<base-domain>:8443`
+
+### Step 6 — Use kubectl
+
+```bash
+export KUBECONFIG=~/.kube/platform-mesh-team.kubeconfig
+kubectl get namespaces
+kubectl get pods -n default
+```
+
+### What You Can and Cannot Do
+
+| Allowed | Not allowed |
+|---|---|
+| List namespaces | Access `kube-system`, `kube-public`, `kube-node-lease` |
+| Create / update / delete resources in application namespaces | Access Kubernetes node API |
+| Read/write CustomResourceDefinitions (cluster-wide) | Manage cluster-level RBAC |
+
+---
+
+## 10. Configuration Reference
+
+### Infrastructure Variables
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `vm_user` | `string` | `"naira"` | Linux user created on the VM |
+| `ssh_public_key` | `string` | *required* | SSH public key for the VM user |
+| `ssh_allowed_cidr` | `string` | *required* | CIDR allowed to reach SSH (e.g., `203.0.113.10/32`) |
+| `platform_mesh_version` | `string` | `"0.2.0"` | Git ref from `platform-mesh/helm-charts` to deploy |
+| `platform_mesh_base_domain` | `string` | `"portal.localhost"` | Base domain for the portal and subdomains |
+| `cloudflare_tunnel_token` | `string` | `null` | Cloudflare Tunnel token (sensitive) |
+| `scaleway_instance_type` | `string` | `"POP2-HC-16C-32G"` | Scaleway instance type |
+| `scaleway_instance_image` | `string` | `"debian_bookworm"` | Scaleway OS image |
+| `scaleway_root_volume_size_gb` | `number` | `100` | Root disk size in GiB (min: 20) |
+| `scaleway_instance_tags` | `list(string)` | `["platform-mesh", "simple-vm"]` | VM tags |
+
+### Cloudflare Variables
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `cloudflare_account_id` | `string` | `null` | Cloudflare account ID. Enables all Zero Trust resources when set. |
+| `cloudflare_tunnel_id` | `string` | `null` | Existing tunnel UUID. Required with `account_id` to create the private route. |
+| `cloudflare_team_email_domains` | `list(string)` | `[]` | Domains allowed in Access policies (e.g., `["company.com"]`) |
+| `cloudflare_team_emails` | `list(string)` | `[]` | Specific emails allowed in Access policies and WARP profile match |
+| `cloudflare_team_access_group_ids` | `list(string)` | `[]` | Existing Access group IDs for policies and WARP profile match |
+| `cloudflare_allowed_idp_ids` | `list(string)` | `[]` | IdP IDs for enrollment and private apps. Empty = all configured IdPs. |
+| `cloudflare_access_policy_session_duration` | `string` | `"24h"` | Session duration for Access policy and private apps |
+| `cloudflare_manage_zero_trust_organization` | `bool` | `false` | Manage account-level WARP auth session setting |
+| `cloudflare_warp_auth_session_duration` | `string` | `"24h"` | Account-level WARP auth session duration |
+| `cloudflare_manage_device_enrollment` | `bool` | `true` | Manage the WARP enrollment application |
+| `cloudflare_manage_private_app_access` | `bool` | `true` | Manage private Access apps for K8s API and portal |
+| `cloudflare_manage_team_warp_profile` | `bool` | `true` | Manage a team-scoped WARP device profile |
+| `cloudflare_warp_profile_match` | `string` | `null` | Override for WARP profile match expression |
+| `cloudflare_warp_profile_name` | `string` | `"Platform Mesh team"` | Name of the custom WARP profile |
+| `cloudflare_warp_profile_precedence` | `number` | `100` | WARP profile precedence (lower wins) |
+| `cloudflare_warp_profile_include_extra_cidrs` | `list(string)` | `[]` | Extra CIDRs for the WARP profile |
+| `cloudflare_warp_profile_include_extra_hosts` | `list(string)` | `[]` | Extra hostnames for the WARP profile (IdP hosts, team domain) |
+
+### Terraform Outputs
+
+| Output | Description |
+|---|---|
+| `public_ip` | VM public IP address (for SSH) |
+| `private_ip` | VM private IP address (used in WARP route and kubeconfig) |
+| `warp_portal_url` | Full portal URL (e.g., `https://portal.localhost:8443`) |
+| `warp_private_route_cidr` | CIDR routed through WARP (`<private-ip>/32`) |
+| `admin_warp_kubeconfig_command` | One-liner to download and patch the admin kubeconfig for WARP access |
+
+---
+
+## 11. Operational Runbook
+
+### Checking Bootstrap Status
+
+```bash
+# Is bootstrap complete?
+ssh naira@<PUBLIC_IP> "cat /var/log/platform-mesh-bootstrap.done"
+
+# View full bootstrap log
+ssh naira@<PUBLIC_IP> "cat /var/log/platform-mesh-bootstrap.log"
+
+# Which stages have completed?
+ssh naira@<PUBLIC_IP> "ls /var/log/platform-mesh-bootstrap.d/"
+```
+
+### Restarting Platform Mesh
+
+If the Kind cluster is down after a VM reboot:
+
+```bash
+ssh naira@<PUBLIC_IP>
+sudo -u naira bash ~/start-platform-mesh.sh
+```
+
+### Re-running Bootstrap
+
+The bootstrap is idempotent. To force a full re-run:
+
+```bash
+ssh naira@<PUBLIC_IP>
+sudo rm -f /var/log/platform-mesh-bootstrap.done
+sudo rm -rf /var/log/platform-mesh-bootstrap.d/
+sudo /usr/local/bin/bootstrap-platform-mesh
+```
+
+### Updating Platform Mesh Version
+
+1. Change `platform_mesh_version` in `dev.tfvars`.
+2. `terraform apply -var-file=dev.tfvars` — this will not re-run cloud-init on an existing VM (cloud-init changes are ignored via `lifecycle { ignore_changes }`).
+3. SSH into the VM and re-run the bootstrap manually:
+
+```bash
+ssh naira@<PUBLIC_IP>
+sudo rm -f /var/log/platform-mesh-bootstrap.done
+sudo rm -rf /var/log/platform-mesh-bootstrap.d/
+# Update the version in the bootstrap script or re-checkout manually:
+cd /opt/platform-mesh/helm-charts
+git fetch --tags --force
+git checkout <new-version>
+sudo /usr/local/bin/bootstrap-platform-mesh
+```
+
+### Adding New Team Members
+
+1. Add their email to `cloudflare_team_emails` in `dev.tfvars`.
+2. `terraform apply -var-file=dev.tfvars` to update Access policies and WARP profile.
+3. Have them follow the Team Onboarding Guide (Section 9).
+4. Distribute the existing team kubeconfig — no server-side changes needed.
+
+### Adding New Namespaces
+
+After new namespaces appear in the cluster, re-sync RBAC:
 
 ```bash
 ./scripts/setup-team-access.sh
 ```
 
-The generated team kubeconfig is backed by a dedicated service account that is bound to the built-in `admin` ClusterRole in non-system namespaces. That means:
-- team members can list namespaces
-- team members can create, update, and delete namespaced resources in application namespaces
-- team members do not get access in `kube-system`, `kube-public`, or `kube-node-lease`
-- they do not get Kubernetes node API access
-- they do get cluster-wide read/write access to `CustomResourceDefinition` objects
-- if you add namespaces later, rerun `./scripts/setup-team-access.sh`
+This re-runs the team access script, which creates RoleBindings in all non-system namespaces.
 
-### 4. Connect to Kubernetes via Cloudflare WARP
+### Rotating the Cloudflare Tunnel Token
 
-Admins can still use the full-access kubeconfig if needed. Once the bootstrap finishes (check `/var/log/platform-mesh-bootstrap.log` on the VM), use:
+1. Generate a new token in the Cloudflare dashboard.
+2. Re-apply with the new token:
 
 ```bash
-# Example command from 'terraform output admin_warp_kubeconfig_command'
-scp naira@<PUBLIC_IP>:/home/naira/.kube/config ./kind.kubeconfig
-perl -0pi -e 's#server: https://127.0.0.1:6443#server: https://<PRIVATE_IP>:6443#g' ./kind.kubeconfig
-export KUBECONFIG=$(pwd)/kind.kubeconfig
-
-# Test direct, secure access (No warnings!)
-kubectl get nodes
+TF_VAR_cloudflare_tunnel_token="<new-token>" terraform apply -var-file=dev.tfvars
 ```
 
-### 5. Access the Portal
-
-The default portal workflow is local port-forwarding plus the VM-generated root CA:
-- Retrieve the restricted team kubeconfig and root CA instructions from `./scripts/onboarding.sh`.
-- Start a local forward with `kubectl --kubeconfig ./platform-mesh-team.kubeconfig -n default port-forward svc/traefik 8443:8443`.
-- Open `https://portal.localhost:8443`.
-- Import the PEM from the `scp` command printed by `./scripts/onboarding.sh` into your workstation trust store if your browser does not trust the portal certificate yet.
-
-#### Why `portal.localhost` Requires Port-Forwarding
-
-The default portal hostname is `portal.localhost`. On macOS, adding a DNS or `/etc/hosts` entry does not make `portal.localhost` behave like a normal remote hostname. Names under `localhost` are treated as loopback on the local machine, so `portal.localhost` resolves to your own computer, not the VM.
-
-Because of that, the supported access method is local `kubectl port-forward`:
+3. SSH into the VM and restart cloudflared:
 
 ```bash
-kubectl --kubeconfig ./platform-mesh-team.kubeconfig -n default port-forward svc/traefik 8443:8443
+ssh naira@<PUBLIC_IP> "sudo systemctl restart cloudflared"
 ```
 
-Then open:
+Note: Cloud-init changes are ignored on existing VMs, so the new token only takes effect if you reinstall cloudflared manually or recreate the VM.
 
-```text
-https://portal.localhost:8443
+### Changing the SSH Allowed CIDR
+
+When your public IP changes:
+
+1. Update `ssh_allowed_cidr` in `dev.tfvars`.
+2. `terraform apply -var-file=dev.tfvars` — this updates the security group immediately.
+
+### Destroying the Environment
+
+```bash
+terraform destroy -var-file=dev.tfvars
 ```
 
-This works because your browser connects to port `8443` on your own machine, and `kubectl` forwards that traffic into the cluster's Traefik service.
+This removes all Scaleway and Cloudflare resources. The S3 state backend bucket is managed separately and is not affected.
 
-This means:
-- `/etc/hosts` is not needed for `portal.localhost`
-- private DNS is not needed for the default setup
-- each user accesses the portal through their own local port-forward
-- the portal is only reachable while the port-forward session is running
+---
 
-If you choose a custom shared hostname instead, set `platform_mesh_base_domain` to that DNS name and map it through your preferred private DNS path.
+## 12. Scripts Reference
 
-## Operational Notes
+| Script | Run From | Purpose |
+|---|---|---|
+| `scripts/onboarding.sh` | Operator workstation | Prints team onboarding instructions derived from current Terraform outputs |
+| `scripts/setup-team-access.sh` | Operator workstation | SSHs into the VM, creates/updates the team service account, RBAC bindings, and team kubeconfig, then copies the kubeconfig locally |
+| `scripts/setup-github-secrets.sh` | Operator workstation | Populates GitHub Actions secrets and repository variables for the CI/CD pipeline via the `gh` CLI |
+| `bootstrap.sh.tftpl` | VM (via cloud-init) | Full VM bootstrap: tool installation, Platform Mesh deployment, cluster configuration, validation |
 
-- **Bootstrap Logs**: Monitor progress with `ssh naira@<PUBLIC_IP> "tail -f /var/log/platform-mesh-bootstrap.log"`.
-- **Certificates**: The Kubernetes API certificate is automatically generated to trust the VM's private IP.
-- **Public Exposure**: `6443` and `8443` are no longer exposed on the VM public IP; reach them through WARP.
-- **Tunnel Token Handling**: If you set `cloudflare_tunnel_token`, the token is rendered into `cloud-init` and stored in Terraform state so bootstrap can install `cloudflared` automatically. Treat your Terraform backend and VM user-data access as sensitive.
-- **Existing Enrollment Apps**: `cloudflare_manage_device_enrollment` defaults to `false` because Cloudflare allows only one WARP enrollment app per account.
-- **Account-Level WARP Auth**: `cloudflare_manage_zero_trust_organization` defaults to `false` because the Zero Trust organization object is persistent and Terraform warns about destroy semantics. Enable it only if you deliberately want Terraform to manage that account-level setting.
-- **Team Helper**: `./scripts/onboarding.sh` prints the live onboarding commands from Terraform outputs, including the local Traefik port-forward command when using `portal.localhost`.
-- **Restricted Team Kubeconfig**: Run `./scripts/onboarding.sh` to print the current copy command for secure distribution, and rerun `./scripts/setup-team-access.sh` after namespace changes.
-- **Shell Profile**: Sourced from `.bashrc`, providing `k` alias, `kubectl` completion, and `KIND_EXPERIMENTAL_PROVIDER=podman`.
-- **Kind Wrapper**: A wrapper at `~/bin/kind` ensures that internal setup scripts do not overwrite our custom TLS settings.
-- **Trusting the Portal**: To trust the portal's browser certificate, run `./scripts/onboarding.sh`, copy the printed root CA `scp` command, and add the PEM to your OS keychain.
+---
 
-## Security Warning: Cloudflare Tunnel Token
-This repository has been updated to accept the `cloudflare_tunnel_token` as a sensitive Terraform variable. 
+## 13. Design Decisions
 
-To prevent this secret from leaking:
-1. **Never** hardcode the token in your `.tfvars` file.
-2. Pass it securely via the command line using `TF_VAR_cloudflare_tunnel_token="<your-token>" terraform apply`.
-3. Because the token is passed to `cloud-init`, it will be visible in the Scaleway console's "User Data" section for this VM, and it will be stored in your `terraform.tfstate` file. Ensure your Terraform backend (e.g., S3) is heavily restricted and encrypted.
+| Decision | Rationale |
+|---|---|
+| **Centralized VM over local setup** | Platform Mesh's complexity (multi-node Kind, CoreDNS patches, TLS injection) makes reliable cross-platform local reproduction a maintenance burden. A shared VM with WARP access is simpler for a small team. |
+| **Kind with Podman** (not Docker) | Runs rootless without Docker Engine; better suited for Debian server environments. |
+| **Cloudflare WARP** (not VPN/SSH tunnel) | Zero Trust identity-aware access; no need to manage VPN infrastructure; per-user audit trail; Split Tunnel keeps non-work traffic off the tunnel. |
+| **Terraform over Makefile** | Terraform is the natural task runner for this infrastructure project. Adding `make` would be an indirection layer without benefit. Helper scripts cover operational tasks. |
+| **No DevContainer** | No local build step or service to run. Editor tooling is lightweight enough for individual setup. |
+| **Idempotent bootstrap with stage markers** | Allows safe re-runs after partial failures without repeating expensive steps (cluster creation, tool downloads). |
+| **Team kubeconfig via service account** | Scoped RBAC without distributing SSH access. Admins control distribution; team members cannot escalate privileges. |
+| **cloud-init `ignore_changes`** | Cloud-init is consumed on first boot only. Ignoring drift avoids Terraform wanting to recreate the VM on every apply when the bootstrap script changes. |
+| **Pinned tool versions with checksums** | Ensures reproducible builds. Kind v0.31.0, Helm v3.14.3, yq v4.43.1 — all verified with SHA-256 before installation. |
+
+---
+
+## 14. Troubleshooting
+
+### Bootstrap never completes
+
+**Check:** `ssh naira@<PUBLIC_IP> "tail -50 /var/log/platform-mesh-bootstrap.log"`
+
+Common causes:
+- **No internet:** The script retries for 60 seconds. Check the Scaleway console for network issues.
+- **Private IP not assigned:** The VPC interface may take time. The script retries for 60 seconds.
+- **Platform Mesh start.sh fails:** Check Kind/Podman status: `ssh naira@<PUBLIC_IP> "systemctl --user status podman.socket"` and `kind get clusters`.
+
+### kubectl cannot reach the cluster over WARP
+
+1. Verify WARP is connected (green icon in the system tray).
+2. Confirm the route is active: `curl -v https://<private-ip>:6443 --insecure` should return a TLS handshake (even if unauthorized).
+3. Check the WARP profile includes the VM's `/32` route: `terraform output warp_private_route_cidr`.
+4. If using Split Tunnel Include mode, ensure your IdP and Cloudflare team domain are listed in `cloudflare_warp_profile_include_extra_hosts`.
+
+### TLS certificate errors when connecting to the K8s API
+
+The bootstrap injects the VM's private IP into the API server's certificate SANs. If you see `x509: certificate is valid for X, not Y`:
+- The private IP may have changed (rare with Scaleway VPC). Check `terraform output private_ip` vs. the kubeconfig server address.
+- Re-run bootstrap to regenerate certificates.
+
+### Portal returns 502 or is unreachable
+
+1. Check Traefik is running: `kubectl get pods -n default | grep traefik`
+2. Check the portal service: `kubectl get svc traefik -n default` — ClusterIP should be `10.96.188.4`.
+3. Check CoreDNS has the domain entry: `kubectl -n kube-system get configmap coredns -o yaml | grep <base-domain>`.
+
+### Terraform plan shows changes to cloud_init
+
+This is expected if you changed any variable that feeds into the bootstrap template. The `lifecycle { ignore_changes = [cloud_init] }` block prevents Terraform from recreating the VM. The change is informational only and will not be applied.
+
+### Cloudflare "only one WARP enrollment app" error
+
+Cloudflare allows only one WARP enrollment application per account. Set `cloudflare_manage_device_enrollment = false` (default) and manage enrollment in the Cloudflare dashboard instead.
+
+---
+
+## 15. File Structure
+
+```
+.
+├── .github/
+│   └── workflows/
+│       └── terraform.yml             # GitHub Actions: plan on PR, apply on main
+├── backend.tf                        # S3 backend declaration
+├── bootstrap.sh.tftpl                # VM bootstrap script (Terraform template)
+├── cloud-init.yml                    # Cloud-init configuration (Terraform template)
+├── cloudflare-access.tf              # Zero Trust: org, policies, enrollment, private apps, WARP profile
+├── cloudflare-route.tf               # Cloudflare Tunnel private route
+├── dev.tfvars                        # Local development variables (gitignored)
+├── locals.tf                         # Computed values: IPs, CIDR, policy includes, feature flags
+├── outputs-infra.tf                  # Terraform outputs
+├── providers.tf                      # Provider configuration (Cloudflare, Scaleway)
+├── scaleway.s3.tfbackend             # S3 backend configuration for Scaleway Object Storage (gitignored)
+├── scaleway.s3.tfbackend.example     # Example backend configuration (committed)
+├── scaleway.tf                       # Scaleway: VPC, IP, security group, VM instance
+├── scripts/
+│   ├── onboarding.sh                 # Print team onboarding instructions
+│   ├── setup-github-secrets.sh       # Populate GitHub Actions secrets/variables via gh CLI
+│   └── setup-team-access.sh          # Create/update team RBAC and kubeconfig
+├── validations.tf                    # Input validation checks
+├── variables-cloudflare.tf           # Cloudflare variable declarations
+├── variables-infra.tf                # Infrastructure variable declarations
+└── versions.tf                       # Required providers and Terraform version
+```
