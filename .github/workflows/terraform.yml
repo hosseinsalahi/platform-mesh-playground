@@ -28,8 +28,8 @@ jobs:
       group: terraform-plan-${{ github.head_ref }}
       cancel-in-progress: true
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.SCW_ACCESS_KEY }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCW_SECRET_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets['TF_STATE_ACCESS_KEY'] || secrets.SCW_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets['TF_STATE_SECRET_KEY'] || secrets.SCW_SECRET_KEY }}
       AWS_REGION: ${{ vars.TF_STATE_REGION }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       SCW_ACCESS_KEY: ${{ secrets.SCW_ACCESS_KEY }}
@@ -201,8 +201,8 @@ jobs:
       group: terraform-state-${{ github.repository }}
       cancel-in-progress: false
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.SCW_ACCESS_KEY }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCW_SECRET_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets['TF_STATE_ACCESS_KEY'] || secrets.SCW_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets['TF_STATE_SECRET_KEY'] || secrets.SCW_SECRET_KEY }}
       AWS_REGION: ${{ vars.TF_STATE_REGION }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       SCW_ACCESS_KEY: ${{ secrets.SCW_ACCESS_KEY }}

@@ -8,6 +8,8 @@
 # Usage:
 #   export SCW_ACCESS_KEY=...
 #   export SCW_SECRET_KEY=...
+#   export TF_STATE_ACCESS_KEY=... # optional; defaults to SCW_ACCESS_KEY
+#   export TF_STATE_SECRET_KEY=... # optional; defaults to SCW_SECRET_KEY
 #   ... (see README CI section)
 #   ./scripts/setup-github-secrets.sh
 #
@@ -62,6 +64,8 @@ main() {
   set_repo_secret SCW_SECRET_KEY "${SCW_SECRET_KEY}"
   set_repo_secret SCW_DEFAULT_PROJECT_ID "${SCW_DEFAULT_PROJECT_ID}"
   set_repo_secret CLOUDFLARE_API_TOKEN "${CLOUDFLARE_API_TOKEN}"
+  set_repo_secret TF_STATE_ACCESS_KEY "${TF_STATE_ACCESS_KEY:-${SCW_ACCESS_KEY}}"
+  set_repo_secret TF_STATE_SECRET_KEY "${TF_STATE_SECRET_KEY:-${SCW_SECRET_KEY}}"
 
   set_repo_secret TF_VAR_SSH_PUBLIC_KEY "${TF_VAR_SSH_PUBLIC_KEY}"
   set_repo_secret TF_VAR_SSH_ALLOWED_CIDR "${TF_VAR_SSH_ALLOWED_CIDR}"

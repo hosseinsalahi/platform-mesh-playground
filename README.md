@@ -143,6 +143,8 @@ Inputs are **not** read from `dev.tfvars` in CI. Configure GitHub **repository s
 | `SCW_ACCESS_KEY` | Scaleway API access key |
 | `SCW_SECRET_KEY` | Scaleway API secret key |
 | `SCW_DEFAULT_PROJECT_ID` | Default Scaleway project ID for the provider |
+| `TF_STATE_ACCESS_KEY` | Optional; S3 access key for the Terraform state bucket. Defaults to `SCW_ACCESS_KEY` if unset |
+| `TF_STATE_SECRET_KEY` | Optional; S3 secret key for the Terraform state bucket. Defaults to `SCW_SECRET_KEY` if unset |
 | `CLOUDFLARE_API_TOKEN` | Cloudflare API token for managed resources |
 | `TF_VAR_SSH_PUBLIC_KEY` | Value for Terraform variable `ssh_public_key` |
 | `TF_VAR_SSH_ALLOWED_CIDR` | Value for Terraform variable `ssh_allowed_cidr` |
@@ -161,6 +163,10 @@ export SCW_ACCESS_KEY=...
 export SCW_SECRET_KEY=...
 export SCW_DEFAULT_PROJECT_ID=...
 export CLOUDFLARE_API_TOKEN=...
+
+# Optional when the state bucket uses separate S3 credentials:
+# export TF_STATE_ACCESS_KEY=...
+# export TF_STATE_SECRET_KEY=...
 
 export TF_VAR_SSH_PUBLIC_KEY='ssh-ed25519 AAAA...'
 export TF_VAR_SSH_ALLOWED_CIDR='203.0.113.10/32'
