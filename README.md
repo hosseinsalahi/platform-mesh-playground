@@ -94,7 +94,7 @@ This repo is already configured to use the Terraform `s3` backend via `backend.t
 cd ../tfstate-bootstrap
 terraform init
 terraform apply -var='bucket_name=<globally-unique-bucket-name>'
-cd ../simple-vm
+cd ../naira-playground
 ```
 
 Then verify `scaleway.s3.tfbackend` points at that bucket and region, export your Scaleway credentials using the AWS-compatible variable names expected by Terraform's `s3` backend, and initialize or migrate the state:
@@ -114,6 +114,83 @@ If you are moving existing local state into the remote backend, use:
 ```bash
 terraform init -migrate-state -reconfigure -backend-config=scaleway.s3.tfbackend
 ```
+
+### GitHub Actions CI
+
+Use the workflow at [`.github/workflows/terraform.yml`](.github/workflows/terraform.yml) when the lab should be owned by automation instead of ad-hoc local applies.
+
+Behavior:
+
+- **Pull requests**: `terraform fmt -check`, `terraform init`, `terraform validate`, `terraform plan`. The rendered plan is posted to the PR as a collapsible comment (and repeated in the job summary); long plans are truncated in the comment with a pointer to logs/summary.
+- **Pushes to `main`**: the same checks, then `terraform plan -out=tfplan` and `terraform apply` using that plan file.
+- **Concurrency**: `main` applies use a single repository-wide concurrency group so two applies cannot run at once. PR plan jobs only cancel earlier runs on the same head branch. The Scaleway S3-compatible backend still has **no Terraform state locking**; treat CI as the single writer and **avoid manual `terraform apply` against the same remote state** while the pipeline is in use.
+
+Inputs are **not** read from `dev.tfvars` in CI. Configure GitHub **repository secrets** and **variables** (or use [`scripts/setup-github-secrets.sh`](scripts/setup-github-secrets.sh) with the GitHub CLI).
+
+**Repository variables** (non-secret; required for the remote backend in CI):
+
+| Variable | Purpose |
+| --- | --- |
+| `TF_STATE_BUCKET` | Scaleway Object Storage bucket name |
+| `TF_STATE_KEY` | State object key inside the bucket |
+| `TF_STATE_REGION` | Region string (e.g. `fr-par`) |
+| `TF_STATE_S3_ENDPOINT` | S3 API URL (e.g. `https://s3.fr-par.scw.cloud`) |
+
+**Repository secrets** (required unless noted optional):
+
+| Secret | Purpose |
+| --- | --- |
+| `SCW_ACCESS_KEY` | Scaleway API access key |
+| `SCW_SECRET_KEY` | Scaleway API secret key |
+| `SCW_DEFAULT_PROJECT_ID` | Default Scaleway project ID for the provider |
+| `TF_STATE_ACCESS_KEY` | Optional; S3 access key for the Terraform state bucket. Defaults to `SCW_ACCESS_KEY` if unset |
+| `TF_STATE_SECRET_KEY` | Optional; S3 secret key for the Terraform state bucket. Defaults to `SCW_SECRET_KEY` if unset |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare API token for managed resources |
+| `TF_VAR_SSH_PUBLIC_KEY` | Value for Terraform variable `ssh_public_key` |
+| `TF_VAR_SSH_ALLOWED_CIDR` | Value for Terraform variable `ssh_allowed_cidr` |
+| `TF_VAR_CLOUDFLARE_TUNNEL_TOKEN` | Optional; same as `TF_VAR_cloudflare_tunnel_token` for bootstrap |
+| `TF_VAR_CLOUDFLARE_ACCOUNT_ID` | Optional; set together with tunnel id if managing Cloudflare routes |
+| `TF_VAR_CLOUDFLARE_TUNNEL_ID` | Optional; set together with account id |
+| `TF_VAR_CLOUDFLARE_TEAM_EMAIL_DOMAINS` | Optional; JSON list string, e.g. `["example.com"]` |
+| `TF_VAR_CLOUDFLARE_TEAM_EMAILS` | Optional; JSON list string, e.g. `["user@example.com"]` |
+
+The workflow exports these as `TF_VAR_<terraform_variable_name>` (for example `TF_VAR_cloudflare_tunnel_token` from `TF_VAR_CLOUDFLARE_TUNNEL_TOKEN`). Optional secrets are only exported when non-empty so Terraform keeps its defaults.
+
+**Bootstrap GitHub from your shell** (after `gh auth login`):
+
+```bash
+export SCW_ACCESS_KEY=...
+export SCW_SECRET_KEY=...
+export SCW_DEFAULT_PROJECT_ID=...
+export CLOUDFLARE_API_TOKEN=...
+
+# Optional when the state bucket uses separate S3 credentials:
+# export TF_STATE_ACCESS_KEY=...
+# export TF_STATE_SECRET_KEY=...
+
+export TF_VAR_SSH_PUBLIC_KEY='ssh-ed25519 AAAA...'
+export TF_VAR_SSH_ALLOWED_CIDR='203.0.113.10/32'
+
+export TF_STATE_BUCKET='your-bucket'
+export TF_STATE_KEY='naira-playground/terraform.tfstate'
+export TF_STATE_REGION='fr-par'
+export TF_STATE_S3_ENDPOINT='https://s3.fr-par.scw.cloud'
+
+# Optional Cloudflare / team inputs (examples):
+# export TF_VAR_CLOUDFLARE_TUNNEL_TOKEN='...'
+# export TF_VAR_CLOUDFLARE_ACCOUNT_ID='...'
+# export TF_VAR_CLOUDFLARE_TUNNEL_ID='...'
+# export TF_VAR_CLOUDFLARE_TEAM_EMAIL_DOMAINS='["reply.com"]'
+# export TF_VAR_CLOUDFLARE_TEAM_EMAILS='["you@example.com"]'
+
+./scripts/setup-github-secrets.sh
+```
+
+**Security**: if a real `cloudflare_tunnel_token` or API token was ever committed to `dev.tfvars` or history, **rotate** it before moving to GitHub secrets.
+
+**Fork pull requests**: workflows triggered from forks do not receive repository secrets; plan jobs from forks will fail unless you use a different approval model.
+
+A template for a local backend file (not committed; `*.tfbackend` is gitignored) lives at [`scaleway.s3.tfbackend.example`](scaleway.s3.tfbackend.example).
 
 If you do not want Terraform to manage Cloudflare resources, leave the Cloudflare Terraform inputs unset and configure the private route and private apps manually in Cloudflare. You can still install and configure `cloudflared` on the VM separately if you need tunnel-based routing.
 
